@@ -1,0 +1,25 @@
+idf_component_register(
+    SRCS
+        "main.c"
+        "frame_mbox.c"
+        "display_comp.c"
+        "cam_builtin.c"
+        "cam_uvc.c"
+        "cam_uvc_ctrl.c"
+        "jpeg_dec.c"
+        "touch_input.c"
+        "camera_ui.c"
+    INCLUDE_DIRS "."
+    PRIV_REQUIRES
+        esp_lcd
+        esp_driver_ppa
+        esp_driver_i2c
+        esp_timer
+        esp_mm
+        espressif__m5stack_tab5
+        espressif__esp_lcd_touch
+        espressif__esp_video
+        espressif__usb_host_uvc
+        esp_driver_jpeg
+        usb
+)

@@ -1,0 +1,8 @@
+# ESP-IDF build output
+build/
+
+# Fetched by the IDF component manager from dependencies.lock
+# (override/esp_video is a local, patched copy and IS tracked)
+managed_components/
+
+sdkconfig.old

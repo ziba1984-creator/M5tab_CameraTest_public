@@ -1,0 +1,8 @@
+dependencies:
+  # This application and its checked-in sdkconfig are validated with ESP-IDF 5.5.6.
+  idf: ">=5.5.6,<5.6"
+  espressif/m5stack_tab5: "^1.3.2"
+  # Local copy with a patch for ESP32-P4 rev < v3.0 (see override/esp_video, csi_video_start)
+  espressif/esp_video:
+    version: "~2.0"
+    override_path: "../override/esp_video"
