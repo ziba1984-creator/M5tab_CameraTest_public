@@ -92,5 +92,5 @@ Tab5 に載っている ESP32-P4 は revision v1.0 です。v3.0 以降とは違
 
 ## ライセンス
 
-- `override/esp_video/` は Espressif Systems のコードで、Apache License 2.0 です（`override/esp_video/LICENSE`）。ローカルで変更した箇所には、コメントで印を付けています。
-- それ以外のファイルのライセンスは、まだ決めていません。
+- このリポジトリのファイルは、`override/esp_video/` を除き **MIT License** です（`LICENSE`）。改変・再配布は自由です。無保証で、使用によって生じたことについて作者は責任を負いません。
+- `override/esp_video/` は Espressif Systems のコードで、Apache License 2.0 のままです（`override/esp_video/LICENSE`）。ローカルで変更した箇所には、コメントで印を付けています。
