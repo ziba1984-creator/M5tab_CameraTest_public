@@ -11,6 +11,8 @@ idf_component_register(
         "camera_ui.c"
         "avi_writer.c"
         "recorder.c"
+        "net_wifi.c"
+        "web_server.c"
     INCLUDE_DIRS "."
     PRIV_REQUIRES
         esp_lcd
@@ -27,4 +29,12 @@ idf_component_register(
         fatfs
         sdmmc
         espressif__esp_codec_dev
+        esp_wifi
+        esp_netif
+        esp_event
+        nvs_flash
+        esp_http_server
+        lwip
+        espressif__esp_hosted
+        espressif__mdns
 )

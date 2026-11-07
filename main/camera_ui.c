@@ -16,17 +16,19 @@
 #include "camera_ui.h"
 #include "display_comp.h"
 #include "recorder.h"
+#include "net_wifi.h"
 
 static const char *TAG = "camera_ui";
 
 #define UI_SRC_W       640
 #define UI_SRC_H        40
-#define UI_BUTTONS      11      /* target, 4 x (-, +), reset, record */
+#define UI_BUTTONS      12      /* target, 4 x (-, +), reset, Wi-Fi, record */
 #define UI_GROUPS        4      /* B, C, S, W: each a "-" / "+" pair */
 #define UI_BTN_TARGET    0
 #define UI_BTN_RESET     9
-#define UI_BTN_REC      10
-#define UI_REC_POLL_MS 500      /* recording state and elapsed time refresh */
+#define UI_BTN_WIFI     10
+#define UI_BTN_REC      11
+#define UI_REC_POLL_MS 500      /* recording and Wi-Fi state, elapsed time refresh */
 #define UI_FONT_SCALE    2
 #define UI_LABEL_Y       4
 #define UI_VALUE_Y      22
@@ -48,6 +50,8 @@ static const char *TAG = "camera_ui";
 #define COLOR_REC_IDLE  0x3000  /* dark red */
 #define COLOR_REC_ON    0xd000  /* bright red: recording */
 #define COLOR_REC_FAIL  0x8200  /* brown: no card or write error */
+#define COLOR_WIFI_OFF  0x2104
+#define COLOR_WIFI_ON   0x0270  /* teal: Wi-Fi up */
 
 typedef enum { TARGET_BUILTIN, TARGET_UVC } target_t;
 
@@ -85,9 +89,10 @@ static cam_uvc_ctrl_info_t s_uvc_auto;
 static int s_pressed = UI_NONE;
 static uint32_t s_render_us_max;
 static recorder_stats_t s_rec;      /* as last drawn */
+static net_status_t s_net;          /* as last drawn */
 
 static const char *const s_labels[UI_BUTTONS] = {
-    "", "B-", "B+", "C-", "C+", "S-", "S+", "W-", "W+", "RST", "REC"
+    "", "B-", "B+", "C-", "C+", "S-", "S+", "W-", "W+", "RST", "WIFI", "REC"
 };
 
 /* Five-bit rows, top to bottom. Only glyphs used by the compact control bar. */
@@ -105,9 +110,11 @@ static void glyph_rows(char ch, uint8_t row[7])
     static const uint8_t c[7] = {14,17,16,16,16,17,14};
     static const uint8_t d[7] = {28,18,17,17,17,18,28};
     static const uint8_t e[7] = {31,16,16,30,16,16,31};
+    static const uint8_t f[7] = {31,16,16,30,16,16,16};
     static const uint8_t i[7] = {14,4,4,4,4,4,14};
     static const uint8_t n[7] = {17,25,21,19,17,17,17};
     static const uint8_t o[7] = {14,17,17,17,17,17,14};
+    static const uint8_t p[7] = {30,17,17,30,16,16,16};
     static const uint8_t r[7] = {30,17,17,30,20,18,17};
     static const uint8_t s[7] = {15,16,16,14,1,1,30};
     static const uint8_t t[7] = {31,4,4,4,4,4,4};
@@ -117,13 +124,15 @@ static void glyph_rows(char ch, uint8_t row[7])
     static const uint8_t plus[7] = {0,4,4,31,4,4,0};
     static const uint8_t minus[7] = {0,0,0,31,0,0,0};
     static const uint8_t colon[7] = {0,4,4,0,4,4,0};
+    static const uint8_t dot[7] = {0,0,0,0,0,12,12};
     switch (ch) {
     case 'A': src = a; break; case 'B': src = b; break; case 'C': src = c; break;
-    case 'D': src = d; break; case 'E': src = e; break;
-    case 'I': src = i; break; case 'N': src = n; break; case 'O': src = o; break;
+    case 'D': src = d; break; case 'E': src = e; break; case 'F': src = f; break;
+    case 'I': src = i; break; case 'N': src = n; break; case 'O': src = o; break; case 'P': src = p; break;
     case 'R': src = r; break; case 'S': src = s; break; case 'T': src = t; break;
     case 'U': src = u; break; case 'V': src = v; break; case 'W': src = w; break;
     case '+': src = plus; break; case '-': src = minus; break; case ':': src = colon; break;
+    case '.': src = dot; break;
     default:
         if (ch >= '0' && ch <= '9') src = digits[ch - '0'];
         break;
@@ -211,6 +220,23 @@ static void render_rec(uint16_t *px)
     put_text_centered(px, x0, UI_SRC_W, UI_VALUE_Y, text, COLOR_VALUE);
 }
 
+/* WIFI: teal while on, with AP (access point only) or STA (also joined the
+ * saved network) underneath; ... while starting, ERR when the C6 failed. */
+static void render_wifi(uint16_t *px)
+{
+    int x0 = button_x(UI_BTN_WIFI), x1 = button_x(UI_BTN_WIFI + 1);
+    uint16_t bg = s_pressed == UI_BTN_WIFI ? COLOR_PRESSED
+                : s_net.state == NET_ON ? COLOR_WIFI_ON
+                : s_net.state == NET_FAILED ? COLOR_REC_FAIL : COLOR_WIFI_OFF;
+    put_rect(px, x0 + 1, 1, x1 - x0 - 2, UI_SRC_H - 2, bg);
+    put_text_centered(px, x0, x1, UI_LABEL_Y, s_labels[UI_BTN_WIFI], COLOR_LABEL);
+    const char *text = s_net.state == NET_STARTING ? "..."
+                     : s_net.state == NET_FAILED ? "ERR"
+                     : s_net.state == NET_OFF ? "OFF"
+                     : s_net.sta_connected ? "STA" : "AP";
+    put_text_centered(px, x0, x1, UI_VALUE_Y, text, COLOR_VALUE);
+}
+
 /* Target switch, then each group drawn as one stepper ("-" and "+" labels on
  * top, the current value centred across both buttons underneath), then reset
  * and record. */
@@ -245,6 +271,7 @@ static void render_bar(uint16_t *px)
              s_pressed == UI_BTN_RESET ? COLOR_RESET_ON : COLOR_RESET);
     put_text_centered(px, x0, x1, UI_CENTER_Y, s_labels[UI_BTN_RESET], COLOR_LABEL);
 
+    render_wifi(px);
     render_rec(px);
 }
 
@@ -403,6 +430,12 @@ static void apply_button(int button)
         recorder_get_stats(&s_rec);
         return;
     }
+    if (button == UI_BTN_WIFI) {
+        bool on = s_net.state == NET_ON || s_net.state == NET_STARTING;
+        net_wifi_enable(!on);
+        ESP_LOGI(TAG, "Wi-Fi %s requested", on ? "off" : "on");
+        return;
+    }
     if (button == UI_BTN_TARGET) {
         s_target = s_target == TARGET_BUILTIN ? TARGET_UVC : TARGET_BUILTIN;
         if (s_target == TARGET_UVC) {
@@ -467,6 +500,12 @@ static void ui_task(void *arg)
             s_rec = st;
             redraw = true;
         }
+        net_status_t net;
+        net_wifi_get_status(&net);
+        if (net.state != s_net.state || net.sta_connected != s_net.sta_connected) {
+            redraw = true;
+        }
+        s_net = net;
         if (redraw) {
             publish_bar();
         }
@@ -491,6 +530,7 @@ esp_err_t camera_ui_init(void)
     ESP_RETURN_ON_FALSE(s_lock && s_queue, ESP_ERR_NO_MEM, TAG, "no memory");
 
     recorder_get_stats(&s_rec);
+    net_wifi_get_status(&s_net);
     render_bar(s_buf[0]);
     s_front = 0;
     s_frame = (video_frame_t){ .data = (uint8_t *)s_buf[0], .w = UI_SRC_W, .h = UI_SRC_H, .stride = UI_SRC_W };

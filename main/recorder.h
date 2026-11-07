@@ -3,6 +3,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include "esp_err.h"
+#include "freertos/FreeRTOS.h"
 
 /* Records the built-in camera (hardware JPEG, MJPEG) and the microphone
  * (16-bit PCM) into AVI files on the microSD card (APP_REC_* in app_config.h). */
@@ -36,3 +37,9 @@ esp_err_t recorder_start(void);
 void recorder_stop(void);
 
 void recorder_get_stats(recorder_stats_t *out);
+
+/* For readers outside the recorder (the web page). True: the card is mounted
+ * under BSP_SD_MOUNT_POINT and stays mounted until recorder_card_release().
+ * False: no card (nothing to release). Keep the lock no longer than needed. */
+bool recorder_card_acquire(TickType_t wait);
+void recorder_card_release(void);

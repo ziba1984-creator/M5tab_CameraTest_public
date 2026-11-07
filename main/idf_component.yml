@@ -6,3 +6,8 @@ dependencies:
   espressif/esp_video:
     version: "~2.0"
     override_path: "../override/esp_video"
+  # Wi-Fi through the on-board ESP32-C6 (SDIO). Host 2.12.x matches the Tab5
+  # factory C6 firmware (1.4.1); do not move to 3.x before the C6 is updated.
+  espressif/esp_wifi_remote: "^1.6"
+  espressif/esp_hosted: "~2.12.0"
+  espressif/mdns: "^1"

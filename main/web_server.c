@@ -1,0 +1,466 @@
+#include <dirent.h>
+#include <inttypes.h>
+#include <stdatomic.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/stat.h>
+#include "esp_heap_caps.h"
+#include "esp_http_server.h"
+#include "esp_log.h"
+#include "esp_netif.h"
+#include "esp_timer.h"
+#include "esp_vfs_fat.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "lwip/sockets.h"
+#include "bsp/m5stack_tab5.h"
+#include "app_config.h"
+#include "cam_builtin.h"
+#include "cam_uvc.h"
+#include "display_comp.h"
+#include "net_wifi.h"
+#include "recorder.h"
+#include "web_server.h"
+
+static const char *TAG = "web";
+
+#define SETTINGS_BODY_MAX   512
+#define SEND_CHUNK          (APP_WEB_SEND_KB * 1024)
+
+static httpd_handle_t s_server;
+
+/* One download at a time, served by its own task so the page keeps updating. */
+static atomic_bool s_dl_busy;
+static atomic_bool s_dl_abort;
+static char s_dl_name[16];
+static uint8_t s_dl_buf[SEND_CHUNK];
+
+static const char PAGE[] =
+"<!doctype html><html lang=ja><meta charset=utf-8>"
+"<meta name=viewport content='width=device-width,initial-scale=1'><title>Tab5 Camera</title><style>"
+"body{font-family:sans-serif;margin:0 auto;padding:12px 16px;max-width:720px;background:#f2f2f2;color:#222}"
+"h1{font-size:20px;margin:4px 0 12px}h2{font-size:16px;margin:0 0 8px}"
+"section{background:#fff;border-radius:8px;padding:12px 14px;margin-bottom:12px;box-shadow:0 1px 2px #0002}"
+"table{border-collapse:collapse;width:100%}td,th{padding:5px 6px;text-align:left;border-bottom:1px solid #eee;font-size:14px}"
+"th{color:#666;font-weight:normal;width:38%}.rec{color:#c00;font-weight:bold}"
+"label{display:block;margin:10px 0 3px;font-size:14px}input{width:100%;box-sizing:border-box;padding:7px;font-size:15px}"
+"button{margin-top:10px;padding:8px 18px;font-size:15px}small{color:#666}#msg{margin-left:10px}"
+"@media(prefers-color-scheme:dark){body{background:#181818;color:#ddd}section{background:#242424}"
+"td,th{border-color:#333}th,small{color:#999}a{color:#7ab}}"
+"</style><h1>Tab5 Camera</h1>"
+"<section><h2>状態</h2><table id=st><tr><td>読み込み中…</td></tr></table></section>"
+"<section><h2>録画ファイル</h2><p id=card></p><table id=files></table>"
+"<button onclick=files()>一覧を更新</button><br><small>ダウンロードは1本ずつ、速さは約0.5MB/秒です"
+"（5分の録画で約7分）。録画中のファイルはダウンロードできません。</small></section>"
+"<section><h2>Wi-Fi 設定</h2><form id=f>"
+"<label>Tab5 のアクセスポイントのパスワード（8〜63文字。空欄なら変えない）</label>"
+"<input name=ap_pass type=password autocomplete=new-password>"
+"<label>接続先のネットワーク名（SSID。空欄にすると接続しない）</label><input name=sta_ssid id=ssid>"
+"<label>接続先のパスワード（ネットワーク名が同じなら、空欄で変えない）</label>"
+"<input name=sta_pass type=password autocomplete=new-password>"
+"<button>保存</button><span id=msg></span></form>"
+"<small>保存すると Wi-Fi が一度切れます。つなぎ直してください。</small></section><script>"
+"const $=i=>document.getElementById(i);let P=null,ssidSet=false;"
+"const row=(k,v)=>'<tr><th>'+k+'</th><td>'+v+'</td></tr>';"
+"const esc=s=>String(s).replace(/[&<>\"']/g,c=>'&#'+c.charCodeAt(0)+';');"
+"const mm=s=>Math.floor(s/60)+':'+String(s%60).padStart(2,'0');"
+"async function status(){try{const s=await(await fetch('/api/status')).json();const p=P;"
+"const dt=p?(s.up-p.up)/1000:0,fps=(a,b)=>dt>0?((a-b)/dt).toFixed(1)+' fps':'…';let r='';"
+"r+=row('内蔵カメラ',fps(s.cam,p&&p.cam));"
+"r+=row('UVC カメラ',s.uvc.on?s.uvc.w+'x'+s.uvc.h+'、'+fps(s.uvc.dec,p&&p.uvc.dec):'なし');"
+"r+=row('画面表示',fps(s.disp,p&&p.disp));"
+"const R=s.rec;r+=row('録画',R.state=='rec'?'<span class=rec>● 録画中</span> '+R.file+' '+mm(R.sec)+"
+"'（コマ落ち '+R.drop+'、音声欠け '+R.adrop+'）':{idle:'停止中',nocard:'SD カードがありません',error:'書き込みエラーで停止'}[R.state]);"
+"const W=s.wifi;r+=row('アクセスポイント',esc(W.ap_ssid)+'（'+W.ap_ip+'、接続 '+W.ap_clients+' 台）');"
+"r+=row('接続先',!W.sta?'設定なし':esc(W.sta_ssid)+(W.sta_conn?'：'+W.sta_ip+'（'+W.rssi+' dBm、ch'+W.ch+'）':'：接続を試みています'));"
+"r+=row('C6 ファーム',W.c6||'-');"
+"r+=row('空きメモリ','内部 '+s.heap.int+' KB、PSRAM '+s.heap.psram+' KB');"
+"r+=row('稼働時間',Math.floor(s.up/60000)+' 分');"
+"$('st').innerHTML=r;if(!ssidSet){$('ssid').value=W.sta_ssid;ssidSet=true}P=s}catch(e){}}"
+"async function files(){const t=$('files');t.innerHTML='<tr><td>読み込み中…</td></tr>';"
+"try{const d=await(await fetch('/api/files')).json();"
+"if(!d.card){$('card').textContent='SD カードがありません';t.innerHTML='';return}"
+"$('card').textContent='空き '+(d.free/1073741824).toFixed(1)+' GB／'+(d.total/1073741824).toFixed(1)+' GB';"
+"d.files.sort((a,b)=>b.n.localeCompare(a.n));"
+"t.innerHTML=d.files.length?d.files.map(f=>'<tr><td>'+(f.n==d.active?f.n+' <span class=rec>録画中</span>':"
+"'<a href=\"/rec/'+f.n+'\" download>'+f.n+'</a>')+'</td><td>'+(f.s/1048576).toFixed(1)+' MB</td></tr>').join('')"
+":'<tr><td>録画ファイルはありません</td></tr>'}catch(e){t.innerHTML='<tr><td>読み込めませんでした</td></tr>'}}"
+"$('f').onsubmit=async e=>{e.preventDefault();$('msg').textContent='保存中…';"
+"try{const r=await fetch('/api/settings',{method:'POST',body:new URLSearchParams(new FormData($('f')))});"
+"$('msg').textContent=r.ok?'保存しました。Wi-Fi を再起動します。':'保存できません：'+await r.text()}"
+"catch(e){$('msg').textContent='送信できませんでした'}};"
+"status();files();setInterval(status,2000);"
+"</script>";
+
+/* ---- helpers ------------------------------------------------------------------- */
+
+/* Copy s into dst as JSON string content (without the quotes). */
+static void json_escape(char *dst, size_t size, const char *s)
+{
+    size_t n = 0;
+    for (; *s && n + 7 < size; s++) {
+        unsigned char c = (unsigned char)*s;
+        if (c == '"' || c == '\\') {
+            dst[n++] = '\\';
+            dst[n++] = (char)c;
+        } else if (c < 0x20) {
+            n += snprintf(dst + n, size - n, "\\u%04x", c);
+        } else {
+            dst[n++] = (char)c;
+        }
+    }
+    dst[n] = '\0';
+}
+
+/* In-place decoding of an application/x-www-form-urlencoded value. */
+static void url_decode(char *s)
+{
+    char *out = s;
+    for (; *s; s++) {
+        if (*s == '+') {
+            *out++ = ' ';
+        } else if (*s == '%' && s[1] && s[2]) {
+            char hex[3] = { s[1], s[2], 0 };
+            *out++ = (char)strtol(hex, NULL, 16);
+            s += 2;
+        } else {
+            *out++ = *s;
+        }
+    }
+    *out = '\0';
+}
+
+static bool valid_rec_name(const char *name)
+{
+    if (strlen(name) != 9 || name[0] != 'R' || strcmp(name + 5, ".AVI") != 0) {
+        return false;
+    }
+    for (int i = 1; i < 5; i++) {
+        if (name[i] < '0' || name[i] > '9') {
+            return false;
+        }
+    }
+    return true;
+}
+
+/* Name of the file being written, or "" when not recording. */
+static void active_file(char *dst, size_t size)
+{
+    recorder_stats_t rec;
+    recorder_get_stats(&rec);
+    if (rec.state == RECORDER_RECORDING) {
+        snprintf(dst, size, "R%04" PRIu32 ".AVI", rec.file_no);
+    } else {
+        dst[0] = '\0';
+    }
+}
+
+static esp_err_t send_text(httpd_req_t *req, const char *status, const char *text)
+{
+    httpd_resp_set_status(req, status);
+    httpd_resp_set_type(req, "text/plain; charset=utf-8");
+    return httpd_resp_sendstr(req, text);
+}
+
+/* ---- handlers ------------------------------------------------------------------ */
+
+static esp_err_t page_get(httpd_req_t *req)
+{
+    httpd_resp_set_type(req, "text/html; charset=utf-8");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    return httpd_resp_send(req, PAGE, sizeof(PAGE) - 1);
+}
+
+static esp_err_t status_get(httpd_req_t *req)
+{
+    frame_mbox_stats_t cam, uvc;
+    frame_mbox_get_stats(cam_builtin_mbox(), &cam);
+    frame_mbox_get_stats(cam_uvc_mbox(), &uvc);
+    display_comp_stats_t disp;
+    display_comp_get_stats(&disp);
+    cam_uvc_stats_t rx;
+    cam_uvc_get_stats(&rx);
+    recorder_stats_t rec;
+    recorder_get_stats(&rec);
+    net_status_t net;
+    net_wifi_get_status(&net);
+
+    static const char *const rec_state[] = { "idle", "rec", "nocard", "error" };
+    char ssid[3 * 33 + 8];
+    json_escape(ssid, sizeof(ssid), net.sta_ssid);
+    char c6[24];
+    json_escape(c6, sizeof(c6), net.c6_version);
+    esp_ip4_addr_t ap_ip = { .addr = net.ap_ip }, sta_ip = { .addr = net.sta_ip };
+
+    char json[1024];
+    int n = snprintf(json, sizeof(json),
+        "{\"up\":%" PRId64 ",\"cam\":%" PRIu32 ",\"disp\":%" PRIu32 ","
+        "\"uvc\":{\"on\":%s,\"w\":%u,\"h\":%u,\"dec\":%" PRIu32 "},"
+        "\"rec\":{\"state\":\"%s\",\"file\":\"R%04" PRIu32 ".AVI\",\"sec\":%" PRIu32 ",\"frames\":%" PRIu32
+        ",\"drop\":%" PRIu32 ",\"adrop\":%" PRIu32 ",\"bytes\":%" PRIu64 "},"
+        "\"wifi\":{\"ap_ssid\":\"%s\",\"ap_ip\":\"" IPSTR "\",\"ap_clients\":%u,\"sta\":%s,\"sta_ssid\":\"%s\","
+        "\"sta_conn\":%s,\"sta_ip\":\"" IPSTR "\",\"rssi\":%d,\"ch\":%u,\"c6\":\"%s\"},"
+        "\"heap\":{\"int\":%u,\"psram\":%u}}",
+        esp_timer_get_time() / 1000, cam.published, disp.flips,
+        rx.streaming ? "true" : "false", rx.w, rx.h, uvc.published,
+        rec_state[rec.state], rec.file_no, rec.seconds, rec.frames, rec.frames_dropped, rec.audio_dropped, rec.bytes,
+        APP_WIFI_AP_SSID, IP2STR(&ap_ip), net.ap_clients, net.sta_configured ? "true" : "false", ssid,
+        net.sta_connected ? "true" : "false", IP2STR(&sta_ip), net.sta_rssi, net.channel, c6,
+        (unsigned)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024),
+        (unsigned)(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024));
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    return httpd_resp_send(req, json, n < (int)sizeof(json) ? n : (int)sizeof(json) - 1);
+}
+
+static esp_err_t files_get(httpd_req_t *req)
+{
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    if (!recorder_card_acquire(pdMS_TO_TICKS(2000))) {
+        return httpd_resp_sendstr(req, "{\"card\":false}");
+    }
+    uint64_t total = 0, free_bytes = 0;
+    esp_vfs_fat_info(BSP_SD_MOUNT_POINT, &total, &free_bytes);
+    char active[16];
+    active_file(active, sizeof(active));
+    char buf[160];
+    snprintf(buf, sizeof(buf), "{\"card\":true,\"total\":%" PRIu64 ",\"free\":%" PRIu64 ",\"active\":\"%s\",\"files\":[",
+             total, free_bytes, active);
+    esp_err_t err = httpd_resp_send_chunk(req, buf, HTTPD_RESP_USE_STRLEN);
+    DIR *dir = opendir(APP_REC_DIR);
+    bool first = true;
+    if (dir) {
+        struct dirent *e;
+        while (err == ESP_OK && (e = readdir(dir)) != NULL) {
+            if (!valid_rec_name(e->d_name)) {
+                continue;
+            }
+            char path[48];
+            struct stat st;
+            snprintf(path, sizeof(path), APP_REC_DIR "/%.9s", e->d_name);
+            if (stat(path, &st) != 0) {
+                continue;
+            }
+            snprintf(buf, sizeof(buf), "%s{\"n\":\"%.9s\",\"s\":%ld}", first ? "" : ",", e->d_name, (long)st.st_size);
+            first = false;
+            err = httpd_resp_send_chunk(req, buf, HTTPD_RESP_USE_STRLEN);
+        }
+        closedir(dir);
+    }
+    recorder_card_release();
+    if (err == ESP_OK) {
+        err = httpd_resp_send_chunk(req, "]}", 2);
+    }
+    if (err == ESP_OK) {
+        err = httpd_resp_send_chunk(req, NULL, 0);
+    }
+    return err;
+}
+
+static bool send_all(httpd_req_t *req, const void *data, size_t len)
+{
+    const char *p = data;
+    int timeouts = 0;
+    while (len > 0) {
+        if (atomic_load(&s_dl_abort)) {
+            return false;
+        }
+        int n = httpd_send(req, p, len);
+        if (n == HTTPD_SOCK_ERR_TIMEOUT && ++timeouts < 3) {
+            continue;
+        }
+        if (n <= 0) {
+            return false;
+        }
+        timeouts = 0;
+        p += n;
+        len -= n;
+    }
+    return true;
+}
+
+static void download_task(void *arg)
+{
+    httpd_req_t *req = arg;
+    char path[48];
+    snprintf(path, sizeof(path), APP_REC_DIR "/%.9s", s_dl_name);
+    bool ok = false;
+    size_t sent = 0;
+    int64_t t0 = esp_timer_get_time();
+
+    if (!recorder_card_acquire(pdMS_TO_TICKS(2000))) {
+        send_text(req, "503 Service Unavailable", "SD カードがありません");
+        goto done;
+    }
+    FILE *f = fopen(path, "rb");
+    struct stat st;
+    if (!f || fstat(fileno(f), &st) != 0) {
+        if (f) fclose(f);
+        recorder_card_release();
+        send_text(req, "404 Not Found", "ファイルがありません");
+        goto done;
+    }
+    setvbuf(f, NULL, _IONBF, 0);    /* whole-chunk reads go straight to the card */
+    int one = 1;
+    setsockopt(httpd_req_to_sockfd(req), IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+    char hdr[256];
+    int len = snprintf(hdr, sizeof(hdr),
+                       "HTTP/1.1 200 OK\r\nContent-Type: video/x-msvideo\r\nContent-Length: %ld\r\n"
+                       "Content-Disposition: attachment; filename=\"%s\"\r\nCache-Control: no-store\r\n\r\n",
+                       (long)st.st_size, s_dl_name);
+    ok = send_all(req, hdr, len);
+    while (ok && sent < (size_t)st.st_size) {
+        size_t n = fread(s_dl_buf, 1, SEND_CHUNK, f);
+        if (n == 0) {
+            ok = false;
+            break;
+        }
+        ok = send_all(req, s_dl_buf, n);
+        sent += ok ? n : 0;
+    }
+    fclose(f);
+    recorder_card_release();
+    int64_t us = esp_timer_get_time() - t0;
+    if (ok) {
+        ESP_LOGI(TAG, "download %s: %u KB in %" PRId64 " ms = %.2f Mbit/s", s_dl_name, (unsigned)(sent / 1024),
+                 us / 1000, us > 0 ? sent * 8.0 / us : 0);
+    } else {
+        ESP_LOGW(TAG, "download %s stopped after %u KB", s_dl_name, (unsigned)(sent / 1024));
+        /* The response is incomplete: close the connection so the browser notices. */
+        httpd_sess_trigger_close(req->handle, httpd_req_to_sockfd(req));
+    }
+done:
+    httpd_req_async_handler_complete(req);
+    atomic_store(&s_dl_busy, false);
+    vTaskDelete(NULL);
+}
+
+static esp_err_t rec_get(httpd_req_t *req)
+{
+    const char *name = req->uri + strlen("/rec/");
+    char clean[16];
+    strlcpy(clean, name, sizeof(clean));
+    char *q = strchr(clean, '?');
+    if (q) *q = '\0';
+    if (!valid_rec_name(clean)) {
+        return send_text(req, "404 Not Found", "ファイルがありません");
+    }
+    char active[16];
+    active_file(active, sizeof(active));
+    if (strcmp(clean, active) == 0) {
+        return send_text(req, "409 Conflict", "録画中のファイルです。録画を止めてからダウンロードしてください");
+    }
+    bool expected = false;
+    if (!atomic_compare_exchange_strong(&s_dl_busy, &expected, true)) {
+        return send_text(req, "503 Service Unavailable", "別のファイルをダウンロード中です");
+    }
+    httpd_req_t *copy = NULL;
+    if (httpd_req_async_handler_begin(req, &copy) != ESP_OK) {
+        atomic_store(&s_dl_busy, false);
+        return send_text(req, "500 Internal Server Error", "開始できませんでした");
+    }
+    strlcpy(s_dl_name, clean, sizeof(s_dl_name));
+    atomic_store(&s_dl_abort, false);
+    if (xTaskCreate(download_task, "web_dl", 4096, copy, APP_WEB_PRIO, NULL) != pdPASS) {
+        send_text(copy, "500 Internal Server Error", "開始できませんでした");
+        httpd_req_async_handler_complete(copy);
+        atomic_store(&s_dl_busy, false);
+    }
+    return ESP_OK;
+}
+
+static esp_err_t settings_post(httpd_req_t *req)
+{
+    if (req->content_len == 0 || req->content_len > SETTINGS_BODY_MAX) {
+        return send_text(req, "400 Bad Request", "入力が長すぎます");
+    }
+    char body[SETTINGS_BODY_MAX + 1];
+    size_t got = 0;
+    while (got < req->content_len) {
+        int n = httpd_req_recv(req, body + got, req->content_len - got);
+        if (n == HTTPD_SOCK_ERR_TIMEOUT) {
+            continue;
+        }
+        if (n <= 0) {
+            return ESP_FAIL;
+        }
+        got += n;
+    }
+    body[got] = '\0';
+
+    char ap_pass[3 * 64 + 1] = "", sta_ssid[3 * 33 + 1] = "", sta_pass[3 * 64 + 1] = "";
+    bool has_ssid = httpd_query_key_value(body, "sta_ssid", sta_ssid, sizeof(sta_ssid)) == ESP_OK;
+    httpd_query_key_value(body, "ap_pass", ap_pass, sizeof(ap_pass));
+    httpd_query_key_value(body, "sta_pass", sta_pass, sizeof(sta_pass));
+    memset(body, 0, sizeof(body));
+    url_decode(ap_pass);
+    url_decode(sta_ssid);
+    url_decode(sta_pass);
+
+    net_status_t net;
+    net_wifi_get_status(&net);
+    bool same_ssid = has_ssid && strcmp(sta_ssid, net.sta_ssid) == 0;
+    /* Empty password: keep it for the same network, an open network for a new one. */
+    const char *pass_arg = sta_pass[0] ? sta_pass : same_ssid ? NULL : "";
+    esp_err_t err = net_wifi_save_settings(ap_pass[0] ? ap_pass : NULL, has_ssid ? sta_ssid : NULL,
+                                           has_ssid ? pass_arg : NULL);
+    memset(ap_pass, 0, sizeof(ap_pass));
+    memset(sta_pass, 0, sizeof(sta_pass));
+    if (err == ESP_ERR_INVALID_ARG) {
+        return send_text(req, "400 Bad Request",
+                         "パスワードは8〜63文字の半角英数字・記号、ネットワーク名は32バイト以内にしてください");
+    }
+    if (err != ESP_OK) {
+        return send_text(req, "500 Internal Server Error", "保存に失敗しました");
+    }
+    return send_text(req, "200 OK", "OK");
+}
+
+/* ---- public -------------------------------------------------------------------- */
+
+esp_err_t web_server_start(void)
+{
+    if (s_server) {
+        return ESP_OK;
+    }
+    httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
+    cfg.stack_size = APP_WEB_STACK;
+    cfg.task_priority = APP_WEB_PRIO;
+    cfg.uri_match_fn = httpd_uri_match_wildcard;
+    cfg.lru_purge_enable = true;
+    cfg.recv_wait_timeout = 10;
+    cfg.send_wait_timeout = 10;
+    esp_err_t err = httpd_start(&s_server, &cfg);
+    if (err != ESP_OK) {
+        s_server = NULL;
+        return err;
+    }
+    const httpd_uri_t uris[] = {
+        { .uri = "/",             .method = HTTP_GET,  .handler = page_get },
+        { .uri = "/api/status",   .method = HTTP_GET,  .handler = status_get },
+        { .uri = "/api/files",    .method = HTTP_GET,  .handler = files_get },
+        { .uri = "/rec/*",        .method = HTTP_GET,  .handler = rec_get },
+        { .uri = "/api/settings", .method = HTTP_POST, .handler = settings_post },
+    };
+    for (size_t i = 0; i < sizeof(uris) / sizeof(uris[0]); i++) {
+        httpd_register_uri_handler(s_server, &uris[i]);
+    }
+    ESP_LOGI(TAG, "web page on port %d", cfg.server_port);
+    return ESP_OK;
+}
+
+void web_server_stop(void)
+{
+    if (!s_server) {
+        return;
+    }
+    /* A running download holds a request of this server: let it finish first. */
+    atomic_store(&s_dl_abort, true);
+    for (int i = 0; i < 50 && atomic_load(&s_dl_busy); i++) {
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+    httpd_stop(s_server);
+    s_server = NULL;
+}

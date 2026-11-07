@@ -25,3 +25,23 @@ CONFIG_BSP_LCD_DPI_BUFFER_NUMS=2
 
 # USB host: UVC cameras have large configuration descriptors (default 256 is too small)
 CONFIG_USB_HOST_CONTROL_TRANSFER_MAX_SIZE=4096
+
+# Wi-Fi: ESP32-C6 on SDIO slot 1 through esp_hosted (see docs/HARDWARE_NOTES.md 7).
+# The Tab5 preset's active-low C6 reset never releases the C6 on this unit.
+CONFIG_SLAVE_IDF_TARGET_ESP32C6=y
+CONFIG_ESP32P4_TAB5_C6_BOARD=y
+CONFIG_ESP_HOSTED_SDIO_RESET_ACTIVE_HIGH=y
+# A C6 link failure must not reboot the P4 (it would cut a recording short);
+# the app reports it on the Wi-Fi button instead.
+# CONFIG_ESP_HOSTED_TRANSPORT_RESTART_ON_FAILURE is not set
+# esp_hosted allocates its ~48 KB SDIO buffer pool in a constructor, before the
+# start-up stack is returned to the heap; internal RAM is too fragmented then
+# in this app (assert in sdio_mempool_create). The P4 can DMA from PSRAM.
+CONFIG_ESP_HOSTED_MEMPOOL_PREFER_SPIRAM=y
+
+# lwIP: the default 5.7 KB TCP window caps file downloads well below the link
+CONFIG_LWIP_TCP_SND_BUF_DEFAULT=65534
+CONFIG_LWIP_TCP_WND_DEFAULT=65534
+CONFIG_LWIP_TCP_RECVMBOX_SIZE=64
+CONFIG_LWIP_TCPIP_RECVMBOX_SIZE=64
+CONFIG_LWIP_TCP_SACK_OUT=y

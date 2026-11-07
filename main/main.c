@@ -5,6 +5,7 @@
 #include "esp_timer.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "esp_netif_ip_addr.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "app_config.h"
@@ -15,6 +16,7 @@
 #include "camera_ui.h"
 #include "cam_uvc_ctrl.h"
 #include "recorder.h"
+#include "net_wifi.h"
 
 static const char *TAG = "main";
 
@@ -241,6 +243,15 @@ static void log_stats(void)
                  (unsigned)rec.write_ms_max, (unsigned)rec.encode_us_max);
     }
     prev_rec = rec;
+
+    net_status_t net;
+    net_wifi_get_status(&net);
+    if (net.state == NET_ON) {
+        esp_ip4_addr_t sta_ip = { .addr = net.sta_ip };
+        ESP_LOGI(TAG, "wifi AP %u client(s) | STA %s " IPSTR " %d dBm ch%u",
+                 net.ap_clients, !net.sta_configured ? "none" : net.sta_connected ? "up" : "joining",
+                 IP2STR(&sta_ip), net.sta_rssi, net.channel);
+    }
 }
 
 #if APP_DISPLAY_BENCH
@@ -282,6 +293,11 @@ void app_main(void)
     esp_err_t rec_err = recorder_init();
     if (rec_err != ESP_OK) {
         ESP_LOGW(TAG, "recording disabled (%s)", esp_err_to_name(rec_err));
+    }
+    /* After the card: both use the SDMMC host (SD on slot 0, the C6 on slot 1). */
+    esp_err_t net_err = net_wifi_init();
+    if (net_err != ESP_OK) {
+        ESP_LOGW(TAG, "Wi-Fi disabled (%s)", esp_err_to_name(net_err));
     }
     esp_err_t ui_err = camera_ui_init();
     if (ui_err != ESP_OK) {
@@ -325,3 +341,4 @@ void app_main(void)
         log_stats();
     }
 }
+

@@ -52,7 +52,8 @@ static void *s_io_buf;
 
 static bool s_ready;                    /* recorder_init() completed */
 static atomic_bool s_active;            /* sources feed the write queue */
-static bool s_card;                     /* microSD mounted (UI task only) */
+static atomic_bool s_card;              /* microSD mounted; mounted/unmounted by the UI task only */
+static SemaphoreHandle_t s_card_mtx;    /* held by other readers of the card (web page) */
 static uint32_t s_next_no;              /* next file number (UI task, then writer) */
 
 /* Owned by the writer task while recording. */
@@ -69,7 +70,7 @@ static bool mount_card(void)
 {
     const esp_vfs_fat_sdmmc_mount_config_t mount = {
         .format_if_mount_failed = false,    /* never erase a card the user put in */
-        .max_files = 2,
+        .max_files = 4,     /* the recording, plus a file read by the web page */
         .allocation_unit_size = 32 * 1024,
     };
     bsp_sdcard_cfg_t cfg = { .mount = &mount };
@@ -327,8 +328,10 @@ esp_err_t recorder_init(void)
         ESP_LOGW(TAG, "microphone unavailable: recordings will have no sound");
     }
     frame_mbox_set_notify(cam_builtin_rec_mbox(), s_evt, EVT_FRAME);
-    s_card = mount_card();
-    s_stats.state = s_card ? RECORDER_IDLE : RECORDER_NO_CARD;
+    s_card_mtx = xSemaphoreCreateMutex();
+    ESP_RETURN_ON_FALSE(s_card_mtx, ESP_ERR_NO_MEM, TAG, "no memory");
+    atomic_store(&s_card, mount_card());
+    s_stats.state = atomic_load(&s_card) ? RECORDER_IDLE : RECORDER_NO_CARD;
 
     ESP_RETURN_ON_FALSE(xTaskCreate(writer_task, "rec_write", APP_TASK_REC_WRITE_STACK, NULL,
                                     APP_TASK_REC_WRITE_PRIO, NULL) == pdPASS &&
@@ -351,18 +354,25 @@ esp_err_t recorder_start(void)
     if (atomic_load(&s_active)) {
         return ESP_OK;
     }
-    if (!s_card) {
-        s_card = mount_card();
+    if (!atomic_load(&s_card)) {
+        /* No reader holds the lock for long while no card is mounted. */
+        xSemaphoreTake(s_card_mtx, portMAX_DELAY);
+        atomic_store(&s_card, mount_card());
+        xSemaphoreGive(s_card_mtx);
     }
-    if (!s_card) {
+    if (!atomic_load(&s_card)) {
         s_stats.state = RECORDER_NO_CARD;
         return ESP_ERR_NOT_FOUND;
     }
     s_next_no = next_file_no();
     if (open_file(s_next_no) != ESP_OK) {
-        /* Card removed or full: remount on the next attempt. */
-        bsp_sdcard_unmount();
-        s_card = false;
+        /* Card removed or full: remount on the next attempt, unless the web page
+         * is reading it right now (then the next attempt tries the card again). */
+        if (xSemaphoreTake(s_card_mtx, 0) == pdTRUE) {
+            bsp_sdcard_unmount();
+            atomic_store(&s_card, false);
+            xSemaphoreGive(s_card_mtx);
+        }
         s_stats.state = RECORDER_NO_CARD;
         return ESP_FAIL;
     }
@@ -405,4 +415,21 @@ void recorder_get_stats(recorder_stats_t *out)
     *out = s_stats;
     out->seconds = s_stats.state == RECORDER_RECORDING
                    ? (uint32_t)((esp_timer_get_time() - s_start_us) / 1000000) : 0;
+}
+
+bool recorder_card_acquire(TickType_t wait)
+{
+    if (!s_ready || xSemaphoreTake(s_card_mtx, wait) != pdTRUE) {
+        return false;
+    }
+    if (!atomic_load(&s_card)) {
+        xSemaphoreGive(s_card_mtx);
+        return false;
+    }
+    return true;
+}
+
+void recorder_card_release(void)
+{
+    xSemaphoreGive(s_card_mtx);
 }

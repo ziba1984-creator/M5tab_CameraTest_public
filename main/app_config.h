@@ -85,3 +85,22 @@
 #define APP_TASK_UVC_DECODE_STACK   6144
 #define APP_TASK_UVC_MGR_PRIO       4
 #define APP_TASK_UVC_MGR_STACK      6144
+
+/* ---- Wi-Fi (ESP32-C6 over SDIO) and the web page ---------------------------
+ * WIFI on the control bar starts an access point (always) and, when a network
+ * is saved on the settings page, joins it as a station. Settings live in NVS.
+ * The AP password below is only the default and is public with this source:
+ * change it on the settings page. */
+#define APP_WIFI_AP_SSID        "Tab5-Camera"
+#define APP_WIFI_AP_PASS        "APtest1234"    /* default, 8..63 characters */
+#define APP_WIFI_AP_CHANNEL     1       /* follows the station's channel once it connects */
+#define APP_WIFI_AP_MAX_CONN    3
+#define APP_WIFI_HOSTNAME       "tab5cam"       /* http://tab5cam.local/ (mDNS) */
+#define APP_WIFI_STA_RETRY_MS   10000   /* each attempt scans, briefly taking the AP off its channel */
+#define APP_WIFI_APPLY_DELAY_MS 1000    /* let the settings page get its reply before Wi-Fi restarts */
+#define APP_TASK_NET_PRIO       3
+#define APP_TASK_NET_STACK      4096
+
+#define APP_WEB_PRIO            2       /* below the camera and recorder tasks */
+#define APP_WEB_STACK           6144
+#define APP_WEB_SEND_KB         16      /* file download chunk (internal RAM) */
