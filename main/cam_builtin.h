@@ -34,6 +34,11 @@ esp_err_t cam_builtin_init(void);
 /* Mailbox the captured frames are published to (valid after init). */
 frame_mbox_t cam_builtin_mbox(void);
 
+/* Second mailbox for the recorder. While recording is on, every frame goes to
+ * both mailboxes and its buffer returns to the driver once both let it go. */
+frame_mbox_t cam_builtin_rec_mbox(void);
+void cam_builtin_set_recording(bool on);
+
 /* Start streaming and the capture task. */
 esp_err_t cam_builtin_start(void);
 

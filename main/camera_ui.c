@@ -15,15 +15,18 @@
 #include "cam_uvc_ctrl.h"
 #include "camera_ui.h"
 #include "display_comp.h"
+#include "recorder.h"
 
 static const char *TAG = "camera_ui";
 
 #define UI_SRC_W       640
 #define UI_SRC_H        40
-#define UI_BUTTONS      10      /* target, 4 x (-, +), reset */
+#define UI_BUTTONS      11      /* target, 4 x (-, +), reset, record */
 #define UI_GROUPS        4      /* B, C, S, W: each a "-" / "+" pair */
 #define UI_BTN_TARGET    0
-#define UI_BTN_RESET    (UI_BUTTONS - 1)
+#define UI_BTN_RESET     9
+#define UI_BTN_REC      10
+#define UI_REC_POLL_MS 500      /* recording state and elapsed time refresh */
 #define UI_FONT_SCALE    2
 #define UI_LABEL_Y       4
 #define UI_VALUE_Y      22
@@ -42,6 +45,9 @@ static const char *TAG = "camera_ui";
 #define COLOR_LABEL     0xffff
 #define COLOR_VALUE     0xffe0  /* yellow */
 #define COLOR_DIVIDER   0x18e3
+#define COLOR_REC_IDLE  0x3000  /* dark red */
+#define COLOR_REC_ON    0xd000  /* bright red: recording */
+#define COLOR_REC_FAIL  0x8200  /* brown: no card or write error */
 
 typedef enum { TARGET_BUILTIN, TARGET_UVC } target_t;
 
@@ -78,9 +84,10 @@ static cam_uvc_ctrl_info_t s_uvc_auto;
 
 static int s_pressed = UI_NONE;
 static uint32_t s_render_us_max;
+static recorder_stats_t s_rec;      /* as last drawn */
 
 static const char *const s_labels[UI_BUTTONS] = {
-    "", "B-", "B+", "C-", "C+", "S-", "S+", "W-", "W+", "RST"
+    "", "B-", "B+", "C-", "C+", "S-", "S+", "W-", "W+", "RST", "REC"
 };
 
 /* Five-bit rows, top to bottom. Only glyphs used by the compact control bar. */
@@ -96,6 +103,8 @@ static void glyph_rows(char ch, uint8_t row[7])
     static const uint8_t a[7] = {14,17,17,31,17,17,17};
     static const uint8_t b[7] = {30,17,17,30,17,17,30};
     static const uint8_t c[7] = {14,17,16,16,16,17,14};
+    static const uint8_t d[7] = {28,18,17,17,17,18,28};
+    static const uint8_t e[7] = {31,16,16,30,16,16,31};
     static const uint8_t i[7] = {14,4,4,4,4,4,14};
     static const uint8_t n[7] = {17,25,21,19,17,17,17};
     static const uint8_t o[7] = {14,17,17,17,17,17,14};
@@ -107,12 +116,14 @@ static void glyph_rows(char ch, uint8_t row[7])
     static const uint8_t w[7] = {17,17,17,21,21,21,10};
     static const uint8_t plus[7] = {0,4,4,31,4,4,0};
     static const uint8_t minus[7] = {0,0,0,31,0,0,0};
+    static const uint8_t colon[7] = {0,4,4,0,4,4,0};
     switch (ch) {
     case 'A': src = a; break; case 'B': src = b; break; case 'C': src = c; break;
+    case 'D': src = d; break; case 'E': src = e; break;
     case 'I': src = i; break; case 'N': src = n; break; case 'O': src = o; break;
     case 'R': src = r; break; case 'S': src = s; break; case 'T': src = t; break;
     case 'U': src = u; break; case 'V': src = v; break; case 'W': src = w; break;
-    case '+': src = plus; break; case '-': src = minus; break;
+    case '+': src = plus; break; case '-': src = minus; break; case ':': src = colon; break;
     default:
         if (ch >= '0' && ch <= '9') src = digits[ch - '0'];
         break;
@@ -178,8 +189,31 @@ static void format_value(int g, char *text, size_t size)
     }
 }
 
+/* REC: red while recording, with the elapsed time underneath; NOSD / ERR when
+ * the last start found no card or the last recording hit a write error. */
+static void render_rec(uint16_t *px)
+{
+    int x0 = button_x(UI_BTN_REC);
+    uint16_t bg = s_pressed == UI_BTN_REC ? COLOR_PRESSED
+                : s_rec.state == RECORDER_RECORDING ? COLOR_REC_ON
+                : s_rec.state == RECORDER_IDLE ? COLOR_REC_IDLE : COLOR_REC_FAIL;
+    put_rect(px, x0 + 1, 1, UI_SRC_W - x0 - 2, UI_SRC_H - 2, bg);
+    put_text_centered(px, x0, UI_SRC_W, UI_LABEL_Y, s_labels[UI_BTN_REC], COLOR_LABEL);
+
+    char text[8] = "";
+    if (s_rec.state == RECORDER_RECORDING) {
+        snprintf(text, sizeof(text), "%" PRIu32 ":%02" PRIu32, s_rec.seconds / 60 % 100, s_rec.seconds % 60);
+    } else if (s_rec.state == RECORDER_NO_CARD) {
+        snprintf(text, sizeof(text), "NOSD");
+    } else if (s_rec.state == RECORDER_ERROR) {
+        snprintf(text, sizeof(text), "ERR");
+    }
+    put_text_centered(px, x0, UI_SRC_W, UI_VALUE_Y, text, COLOR_VALUE);
+}
+
 /* Target switch, then each group drawn as one stepper ("-" and "+" labels on
- * top, the current value centred across both buttons underneath), then reset. */
+ * top, the current value centred across both buttons underneath), then reset
+ * and record. */
 static void render_bar(uint16_t *px)
 {
     put_rect(px, 0, 0, UI_SRC_W, UI_SRC_H, COLOR_BAR);
@@ -206,10 +240,12 @@ static void render_bar(uint16_t *px)
         put_text_centered(px, x0, x1, UI_VALUE_Y, text, COLOR_VALUE);
     }
 
-    int x0 = button_x(UI_BTN_RESET);
-    put_rect(px, x0 + 1, 1, UI_SRC_W - x0 - 2, UI_SRC_H - 2,
+    int x0 = button_x(UI_BTN_RESET), x1 = button_x(UI_BTN_RESET + 1);
+    put_rect(px, x0 + 1, 1, x1 - x0 - 2, UI_SRC_H - 2,
              s_pressed == UI_BTN_RESET ? COLOR_RESET_ON : COLOR_RESET);
-    put_text_centered(px, x0, UI_SRC_W, UI_CENTER_Y, s_labels[UI_BTN_RESET], COLOR_LABEL);
+    put_text_centered(px, x0, x1, UI_CENTER_Y, s_labels[UI_BTN_RESET], COLOR_LABEL);
+
+    render_rec(px);
 }
 
 /* Render into the back image, swap it in and ask the display for a redraw. */
@@ -355,6 +391,18 @@ static void uvc_reset(void)
 
 static void apply_button(int button)
 {
+    if (button == UI_BTN_REC) {
+        recorder_stats_t st;
+        recorder_get_stats(&st);
+        if (st.state == RECORDER_RECORDING) {
+            recorder_stop();
+        } else {
+            esp_err_t err = recorder_start();
+            ESP_LOGI(TAG, "record start: %s", esp_err_to_name(err));
+        }
+        recorder_get_stats(&s_rec);
+        return;
+    }
     if (button == UI_BTN_TARGET) {
         s_target = s_target == TARGET_BUILTIN ? TARGET_UVC : TARGET_BUILTIN;
         if (s_target == TARGET_UVC) {
@@ -388,10 +436,12 @@ static void ui_task(void *arg)
 {
     TickType_t highlight_end = 0;
     for (;;) {
-        TickType_t wait = portMAX_DELAY;
+        /* Wake at least every UI_REC_POLL_MS to follow the recorder (elapsed
+         * time, or a recording the writer stopped on an error). */
+        TickType_t wait = pdMS_TO_TICKS(UI_REC_POLL_MS);
         if (s_pressed != UI_NONE) {
             int32_t left = (int32_t)(highlight_end - xTaskGetTickCount());
-            wait = left > 0 ? (TickType_t)left : 0;
+            wait = left <= 0 ? 0 : (TickType_t)left < wait ? (TickType_t)left : wait;
         }
         int button;
         if (xQueueReceive(s_queue, &button, wait) == pdTRUE) {
@@ -404,8 +454,20 @@ static void ui_task(void *arg)
             s_pressed = button;
             highlight_end = xTaskGetTickCount() + pdMS_TO_TICKS(APP_UI_HIGHLIGHT_MS);
             publish_bar();
-        } else if (s_pressed != UI_NONE) {
+            continue;
+        }
+        bool redraw = false;
+        if (s_pressed != UI_NONE && (int32_t)(highlight_end - xTaskGetTickCount()) <= 0) {
             s_pressed = UI_NONE;
+            redraw = true;
+        }
+        recorder_stats_t st;
+        recorder_get_stats(&st);
+        if (st.state != s_rec.state || st.seconds != s_rec.seconds) {
+            s_rec = st;
+            redraw = true;
+        }
+        if (redraw) {
             publish_bar();
         }
     }
@@ -428,6 +490,7 @@ esp_err_t camera_ui_init(void)
     s_queue = xQueueCreate(4, sizeof(int));
     ESP_RETURN_ON_FALSE(s_lock && s_queue, ESP_ERR_NO_MEM, TAG, "no memory");
 
+    recorder_get_stats(&s_rec);
     render_bar(s_buf[0]);
     s_front = 0;
     s_frame = (video_frame_t){ .data = (uint8_t *)s_buf[0], .w = UI_SRC_W, .h = UI_SRC_H, .stride = UI_SRC_W };

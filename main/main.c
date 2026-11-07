@@ -14,6 +14,7 @@
 #include "touch_input.h"
 #include "camera_ui.h"
 #include "cam_uvc_ctrl.h"
+#include "recorder.h"
 
 static const char *TAG = "main";
 
@@ -225,6 +226,21 @@ static void log_stats(void)
     prev_uvc = uvc;
     prev_disp = disp;
     prev_rx = rx;
+
+    static recorder_stats_t prev_rec;
+    recorder_stats_t rec;
+    recorder_get_stats(&rec);
+    if (rec.state == RECORDER_RECORDING) {
+        /* The frame count restarts with each recording. */
+        bool same = prev_rec.state == RECORDER_RECORDING && rec.frames >= prev_rec.frames;
+        ESP_LOGI(TAG, "rec R%04u.AVI %u s | %.1f fps written, dropped %u frames %u audio | %.1f MB | "
+                      "longest write %u ms, encode %u us",
+                 (unsigned)rec.file_no, (unsigned)rec.seconds,
+                 (same ? rec.frames - prev_rec.frames : rec.frames) / secs,
+                 (unsigned)rec.frames_dropped, (unsigned)rec.audio_dropped, rec.bytes / 1048576.0,
+                 (unsigned)rec.write_ms_max, (unsigned)rec.encode_us_max);
+    }
+    prev_rec = rec;
 }
 
 #if APP_DISPLAY_BENCH
@@ -263,6 +279,10 @@ void app_main(void)
         ESP_LOGW(TAG, "touch disabled (%s)", esp_err_to_name(touch_err));
     }
     ESP_ERROR_CHECK(cam_builtin_init());
+    esp_err_t rec_err = recorder_init();
+    if (rec_err != ESP_OK) {
+        ESP_LOGW(TAG, "recording disabled (%s)", esp_err_to_name(rec_err));
+    }
     esp_err_t ui_err = camera_ui_init();
     if (ui_err != ESP_OK) {
         ESP_LOGW(TAG, "camera UI disabled (%s)", esp_err_to_name(ui_err));

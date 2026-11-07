@@ -13,7 +13,7 @@
 /* ---- Built-in camera (SC202CS, MIPI-CSI) -------------------------------- */
 #define APP_CAM_BUILTIN_W       1280
 #define APP_CAM_BUILTIN_H       720
-#define APP_CAM_BUILTIN_BUFS    4
+#define APP_CAM_BUILTIN_BUFS    6       /* display and recorder may each hold two while recording */
 #define APP_CAM_BUILTIN_ROT_DEG 0       /* extra rotation of the image (0/90/180/270, CCW) */
 #define APP_CAM_CONTROL_TEST    0       /* temporary live-control verification */
 #define APP_CAM_CCM_TEST        0       /* temporary CCM persistence verification */
@@ -57,6 +57,28 @@
 #define APP_UVC_APPLY_DELAY_MS  1500    /* quiet time after the last tap before a settings restart */
 #define APP_UVC_STALL_TEST      0       /* temporary: stop the stream once after 20 s to test recovery */
 #define APP_UVC_CTRL_TEST       0       /* temporary: sweep UVC controls and measure the effect */
+
+/* ---- Recording (built-in camera + microphone -> AVI on microSD) ------------
+ * REC on the control bar records MJPEG video (hardware JPEG) and 16-bit PCM
+ * audio into /sdcard/REC/Rnnnn.AVI, starting a new file every SEGMENT_S. */
+#define APP_REC_DIR             "/sdcard/REC"
+#define APP_REC_QUALITY         70      /* JPEG quality 1..100 */
+#define APP_REC_SEGMENT_S       300     /* start a new file after this many seconds */
+#define APP_REC_VIDEO_SLOTS     12      /* encoded frames waiting for the card (~0.4 s at 30 fps) */
+#define APP_REC_VIDEO_SLOT_KB   192     /* largest JPEG frame accepted */
+#define APP_REC_AUDIO_RATE      16000
+#define APP_REC_AUDIO_GAIN_DB   30.0f
+#define APP_REC_AUDIO_CHUNK_MS  100     /* one AVI audio chunk */
+#define APP_REC_AUDIO_SLOTS     24      /* audio chunks waiting for the card (2.4 s) */
+#define APP_REC_AUDIO_SKIP_MS   200     /* drop the codec's start-up click */
+#define APP_REC_WRITE_BUF_KB    32      /* stdio buffer: the card is fastest with 32 KB internal-RAM writes */
+
+#define APP_TASK_REC_AUDIO_PRIO     7   /* read-only loop: the I2S DMA ring holds only ~0.1 s */
+#define APP_TASK_REC_AUDIO_STACK    4096
+#define APP_TASK_REC_ENC_PRIO       4
+#define APP_TASK_REC_ENC_STACK      4096
+#define APP_TASK_REC_WRITE_PRIO     2
+#define APP_TASK_REC_WRITE_STACK    6144
 
 #define APP_TASK_UVC_DRIVER_PRIO    11  /* must be above the tasks using the driver */
 #define APP_TASK_UVC_DECODE_PRIO    5

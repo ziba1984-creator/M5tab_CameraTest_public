@@ -1,4 +1,5 @@
 #include <fcntl.h>
+#include <stdatomic.h>
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
@@ -22,6 +23,9 @@ typedef struct {
     uint32_t buf_len[APP_CAM_BUILTIN_BUFS];
     uint16_t w, h;
     frame_mbox_t mbox;
+    frame_mbox_t rec_mbox;
+    atomic_int refs[APP_CAM_BUILTIN_BUFS];  /* mailboxes still holding each buffer */
+    atomic_bool recording;
 } cam_ctx_t;
 
 static cam_ctx_t s_cam = { .fd = -1, .isp_fd = -1 };
@@ -183,12 +187,16 @@ static esp_err_t queue_buffer(int index)
     return ioctl(s_cam.fd, VIDIOC_QBUF, &buf) == 0 ? ESP_OK : ESP_FAIL;
 }
 
-/* Called from normal task context by the consumer (or from publish). Re-queue
- * immediately: deferring this until the capture task runs again can deadlock,
- * because VIDIOC_DQBUF waits forever once every driver buffer is held. */
+/* Called from normal task context by a consumer (or from publish). The last
+ * mailbox to let a buffer go re-queues it immediately: deferring this until the
+ * capture task runs again can deadlock, because VIDIOC_DQBUF waits forever once
+ * every driver buffer is held. */
 static void on_frame_release(const video_frame_t *frame, void *ctx)
 {
     int index = (int)(intptr_t)frame->priv;
+    if (atomic_fetch_sub(&s_cam.refs[index], 1) != 1) {
+        return;
+    }
     if (queue_buffer(index) != ESP_OK) {
         ESP_LOGE(TAG, "QBUF %d failed", index);
     }
@@ -218,7 +226,13 @@ static void capture_task(void *arg)
             .stride = s_cam.w,
             .priv = (void *)(intptr_t)buf.index,
         };
+        /* Count both holders before either mailbox can release the buffer. */
+        bool rec = atomic_load(&s_cam.recording);
+        atomic_store(&s_cam.refs[buf.index], rec ? 2 : 1);
         frame_mbox_publish(s_cam.mbox, &frame);
+        if (rec) {
+            frame_mbox_publish(s_cam.rec_mbox, &frame);
+        }
     }
 }
 
@@ -274,7 +288,8 @@ esp_err_t cam_builtin_init(void)
     }
 
     s_cam.mbox = frame_mbox_create(on_frame_release, NULL);
-    ESP_RETURN_ON_FALSE(s_cam.mbox, ESP_ERR_NO_MEM, TAG, "no memory");
+    s_cam.rec_mbox = frame_mbox_create(on_frame_release, NULL);
+    ESP_RETURN_ON_FALSE(s_cam.mbox && s_cam.rec_mbox, ESP_ERR_NO_MEM, TAG, "no memory");
     log_supported_controls();
     return ESP_OK;
 }
@@ -282,6 +297,18 @@ esp_err_t cam_builtin_init(void)
 frame_mbox_t cam_builtin_mbox(void)
 {
     return s_cam.mbox;
+}
+
+frame_mbox_t cam_builtin_rec_mbox(void)
+{
+    return s_cam.rec_mbox;
+}
+
+/* Turning recording off only stops new frames: one the recorder has not taken
+ * yet stays in rec_mbox (holding its buffer) until the recorder drains it. */
+void cam_builtin_set_recording(bool on)
+{
+    atomic_store(&s_cam.recording, on);
 }
 
 esp_err_t cam_builtin_start(void)

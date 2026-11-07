@@ -9,6 +9,8 @@ idf_component_register(
         "jpeg_dec.c"
         "touch_input.c"
         "camera_ui.c"
+        "avi_writer.c"
+        "recorder.c"
     INCLUDE_DIRS "."
     PRIV_REQUIRES
         esp_lcd
@@ -22,4 +24,7 @@ idf_component_register(
         espressif__usb_host_uvc
         esp_driver_jpeg
         usb
+        fatfs
+        sdmmc
+        espressif__esp_codec_dev
 )
