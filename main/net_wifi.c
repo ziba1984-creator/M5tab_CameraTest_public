@@ -339,7 +339,13 @@ static void turn_on(void)
 static void turn_off(void)
 {
     if (atomic_load(&s_running)) {
-        web_server_stop();
+        if (web_server_stop() != ESP_OK) {
+            /* A download still owns the web server: keep Wi-Fi and the server
+             * consistent (both on) and let the user switch off again. */
+            ESP_LOGE(TAG, "Wi-Fi stays on: the web server could not be stopped");
+            set_state(NET_ON);
+            return;
+        }
         stop_wifi();
         ESP_LOGI(TAG, "Wi-Fi off");
     }
@@ -369,7 +375,11 @@ static void net_task(void *arg)
                 atomic_store(&s_apply_pending, false);
                 stop_wifi();
                 if (start_wifi() != ESP_OK) {
-                    web_server_stop();
+                    /* If a download still holds it, the server stays; the next
+                     * start reuses it (web_server_start accepts it again). */
+                    if (web_server_stop() != ESP_OK) {
+                        ESP_LOGW(TAG, "web server left running while Wi-Fi is down");
+                    }
                     set_state(NET_FAILED);
                 }
             } else {

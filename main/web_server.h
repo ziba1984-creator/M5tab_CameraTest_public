@@ -9,4 +9,6 @@
  *   GET  /rec/Rnnnn.AVI    download one recording (one download at a time)
  *   POST /api/settings     form fields ap_pass, sta_ssid, sta_pass */
 esp_err_t web_server_start(void);
-void web_server_stop(void);
+/* Waits for a running download to end first. ESP_ERR_TIMEOUT: it did not end
+ * within 15 s, so the server was left running (it refuses new downloads). */
+esp_err_t web_server_stop(void);

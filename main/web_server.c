@@ -34,10 +34,21 @@ static const char *TAG = "web";
 static httpd_handle_t s_server;
 
 /* One download at a time, served by its own task so the page keeps updating. */
-static atomic_bool s_dl_busy;
+/* Download start/stop protocol. Everything below is changed only under s_dl_mtx
+ * (s_dl_abort is also read without it by the send loop):
+ *  - rec_get() claims s_dl_busy only while !s_stopping, and resets s_dl_abort and
+ *    drains s_dl_done in the same locked section;
+ *  - web_server_stop() sets s_stopping first, so no download can start after it
+ *    has looked at s_dl_busy;
+ *  - whoever releases a claim (download task, or rec_get on a failed start) clears
+ *    s_dl_busy and gives s_dl_done in one locked section, so a waiting stop sees
+ *    exactly the completion of the download it saw, never a stale one. */
+static SemaphoreHandle_t s_dl_mtx;
+static bool s_stopping;                 /* web_server_stop() has begun; refuse new downloads */
+static bool s_dl_busy;                  /* a download owns (or is about to own) an async request */
 static atomic_bool s_dl_abort;
-static atomic_int s_dl_fd = -1;          /* socket of the running download */
-static SemaphoreHandle_t s_dl_done;     /* given when the download task has completed its request */
+static int s_dl_fd = -1;                /* socket of the running download, -1 until published */
+static SemaphoreHandle_t s_dl_done;     /* given when a claim is released */
 static char s_dl_name[16];
 /* The card reads straight into this buffer by DMA only when it is cache-line
  * aligned; otherwise the driver falls back to one bounce-buffered sector per command. */
@@ -280,6 +291,16 @@ static bool send_all(httpd_req_t *req, const void *data, size_t len)
     return true;
 }
 
+/* Ends a claim taken by rec_get(): after this, web_server_stop() may free the server. */
+static void release_download(void)
+{
+    xSemaphoreTake(s_dl_mtx, portMAX_DELAY);
+    s_dl_fd = -1;
+    s_dl_busy = false;
+    xSemaphoreGive(s_dl_done);
+    xSemaphoreGive(s_dl_mtx);
+}
+
 static void download_task(void *arg)
 {
     httpd_req_t *req = arg;
@@ -304,10 +325,12 @@ static void download_task(void *arg)
         goto done;
     }
     int one = 1;
-    atomic_store(&s_dl_fd, httpd_req_to_sockfd(req));
+    xSemaphoreTake(s_dl_mtx, portMAX_DELAY);
+    s_dl_fd = httpd_req_to_sockfd(req);
     if (atomic_load(&s_dl_abort)) {     /* stop arrived before the socket was published */
-        shutdown(httpd_req_to_sockfd(req), SHUT_RDWR);
+        shutdown(s_dl_fd, SHUT_RDWR);
     }
+    xSemaphoreGive(s_dl_mtx);
     setsockopt(httpd_req_to_sockfd(req), IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
     char hdr[256];
     int len = snprintf(hdr, sizeof(hdr),
@@ -336,10 +359,8 @@ static void download_task(void *arg)
         httpd_sess_trigger_close(req->handle, httpd_req_to_sockfd(req));
     }
 done:
-    httpd_req_async_handler_complete(req);
-    atomic_store(&s_dl_fd, -1);
-    atomic_store(&s_dl_busy, false);
-    xSemaphoreGive(s_dl_done);      /* web_server_stop() may now free the server */
+    httpd_req_async_handler_complete(req);  /* last use of req and its server */
+    release_download();
     vTaskDelete(NULL);
 }
 
@@ -358,23 +379,32 @@ static esp_err_t rec_get(httpd_req_t *req)
     if (strcmp(clean, active) == 0) {
         return send_text(req, "409 Conflict", "録画中のファイルです。録画を止めてからダウンロードしてください");
     }
-    bool expected = false;
-    if (!atomic_compare_exchange_strong(&s_dl_busy, &expected, true)) {
+    xSemaphoreTake(s_dl_mtx, portMAX_DELAY);
+    bool stopping = s_stopping, busy = s_dl_busy;
+    if (!stopping && !busy) {
+        s_dl_busy = true;
+        atomic_store(&s_dl_abort, false);   /* safe: no stop has begun (s_stopping is false) */
+        s_dl_fd = -1;
+        xSemaphoreTake(s_dl_done, 0);       /* no claim is outstanding, so any token is stale */
+        strlcpy(s_dl_name, clean, sizeof(s_dl_name));
+    }
+    xSemaphoreGive(s_dl_mtx);
+    if (stopping) {
+        return send_text(req, "503 Service Unavailable", "Web ページを停止中です");
+    }
+    if (busy) {
         return send_text(req, "503 Service Unavailable", "別のファイルをダウンロード中です");
     }
+    /* From here this request holds the claim: every path below must release it once. */
     httpd_req_t *copy = NULL;
     if (httpd_req_async_handler_begin(req, &copy) != ESP_OK) {
-        atomic_store(&s_dl_busy, false);
+        release_download();
         return send_text(req, "500 Internal Server Error", "開始できませんでした");
     }
-    strlcpy(s_dl_name, clean, sizeof(s_dl_name));
-    atomic_store(&s_dl_abort, false);
-    xSemaphoreTake(s_dl_done, 0);   /* clear a stale completion */
     if (xTaskCreate(download_task, "web_dl", 4096, copy, APP_WEB_PRIO, NULL) != pdPASS) {
         send_text(copy, "500 Internal Server Error", "開始できませんでした");
         httpd_req_async_handler_complete(copy);
-        atomic_store(&s_dl_busy, false);
-        xSemaphoreGive(s_dl_done);
+        release_download();
     }
     return ESP_OK;
 }
@@ -431,6 +461,10 @@ static esp_err_t settings_post(httpd_req_t *req)
 esp_err_t web_server_start(void)
 {
     if (s_server) {
+        /* Left running by a stop that timed out: in use again, accept downloads. */
+        xSemaphoreTake(s_dl_mtx, portMAX_DELAY);
+        s_stopping = false;
+        xSemaphoreGive(s_dl_mtx);
         return ESP_OK;
     }
     if (!s_dl_buf) {
@@ -439,11 +473,16 @@ esp_err_t web_server_start(void)
             return ESP_ERR_NO_MEM;
         }
     }
+    /* Each created on its own when missing, so a start that failed half way is
+     * retried safely (no NULL mutex in use, nothing created twice). */
     if (!s_dl_done) {
         s_dl_done = xSemaphoreCreateBinary();
-        if (!s_dl_done) {
-            return ESP_ERR_NO_MEM;
-        }
+    }
+    if (!s_dl_mtx) {
+        s_dl_mtx = xSemaphoreCreateMutex();
+    }
+    if (!s_dl_done || !s_dl_mtx) {
+        return ESP_ERR_NO_MEM;
     }
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
     cfg.stack_size = APP_WEB_STACK;
@@ -457,6 +496,9 @@ esp_err_t web_server_start(void)
         s_server = NULL;
         return err;
     }
+    xSemaphoreTake(s_dl_mtx, portMAX_DELAY);
+    s_stopping = false;
+    xSemaphoreGive(s_dl_mtx);
     const httpd_uri_t uris[] = {
         { .uri = "/",             .method = HTTP_GET,  .handler = page_get },
         { .uri = "/api/status",   .method = HTTP_GET,  .handler = status_get },
@@ -471,26 +513,38 @@ esp_err_t web_server_start(void)
     return ESP_OK;
 }
 
-void web_server_stop(void)
+esp_err_t web_server_stop(void)
 {
     if (!s_server) {
-        return;
+        return ESP_OK;
     }
-    /* A running download owns an async request of this server: the server may be
-     * freed only after the download task has completed it. Shutting the socket
-     * down ends a send that is blocked on a stalled client. */
-    if (atomic_load(&s_dl_busy)) {
+    /* From here on rec_get() refuses new downloads, so s_dl_busy can only go
+     * from true to false. A running download owns an async request of this
+     * server: free the server only after that request has been completed.
+     * Shutting the socket down ends a send blocked on a stalled client. */
+    xSemaphoreTake(s_dl_mtx, portMAX_DELAY);
+    s_stopping = true;
+    bool busy = s_dl_busy;
+    if (busy) {
         atomic_store(&s_dl_abort, true);
-        int fd = atomic_load(&s_dl_fd);
-        if (fd >= 0) {
-            shutdown(fd, SHUT_RDWR);
-        }
-        if (xSemaphoreTake(s_dl_done, pdMS_TO_TICKS(15000)) != pdTRUE) {
-            /* Never free a server that a task may still use: keep it running. */
-            ESP_LOGE(TAG, "download did not finish; web server left running");
-            return;
+        if (s_dl_fd >= 0) {
+            shutdown(s_dl_fd, SHUT_RDWR);
         }
     }
-    httpd_stop(s_server);
+    xSemaphoreGive(s_dl_mtx);
+    if (busy && xSemaphoreTake(s_dl_done, pdMS_TO_TICKS(15000)) != pdTRUE) {
+        /* Never free a server a task may still use. It stays up (and keeps
+         * refusing downloads) until a later stop succeeds. */
+        ESP_LOGE(TAG, "download did not finish; web server left running");
+        return ESP_ERR_TIMEOUT;
+    }
+    esp_err_t err = httpd_stop(s_server);
+    if (err != ESP_OK) {
+        /* The server may still be running: keep its handle (and the stopping
+         * state) so the caller can report it and a later stop can retry. */
+        ESP_LOGE(TAG, "httpd_stop failed (%s); web server left running", esp_err_to_name(err));
+        return err;
+    }
     s_server = NULL;
+    return ESP_OK;
 }
