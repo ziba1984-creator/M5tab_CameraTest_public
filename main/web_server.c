@@ -1,4 +1,6 @@
 #include <dirent.h>
+#include <fcntl.h>
+#include <unistd.h>
 #include <inttypes.h>
 #include <stdatomic.h>
 #include <stdio.h>
@@ -12,6 +14,7 @@
 #include "esp_timer.h"
 #include "esp_vfs_fat.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "lwip/sockets.h"
 #include "bsp/m5stack_tab5.h"
@@ -33,8 +36,12 @@ static httpd_handle_t s_server;
 /* One download at a time, served by its own task so the page keeps updating. */
 static atomic_bool s_dl_busy;
 static atomic_bool s_dl_abort;
+static atomic_int s_dl_fd = -1;          /* socket of the running download */
+static SemaphoreHandle_t s_dl_done;     /* given when the download task has completed its request */
 static char s_dl_name[16];
-static uint8_t s_dl_buf[SEND_CHUNK];
+/* The card reads straight into this buffer by DMA only when it is cache-line
+ * aligned; otherwise the driver falls back to one bounce-buffered sector per command. */
+static uint8_t *s_dl_buf;
 
 static const char PAGE[] =
 "<!doctype html><html lang=ja><meta charset=utf-8>"
@@ -51,8 +58,8 @@ static const char PAGE[] =
 "</style><h1>Tab5 Camera</h1>"
 "<section><h2>状態</h2><table id=st><tr><td>読み込み中…</td></tr></table></section>"
 "<section><h2>録画ファイル</h2><p id=card></p><table id=files></table>"
-"<button onclick=files()>一覧を更新</button><br><small>ダウンロードは1本ずつ、速さは約0.5MB/秒です"
-"（5分の録画で約7分）。録画中のファイルはダウンロードできません。</small></section>"
+"<button onclick=files()>一覧を更新</button><br><small>ダウンロードは1本ずつ、速さは約0.9MB/秒です"
+"（5分の録画で約4分）。録画中のファイルはダウンロードできません。</small></section>"
 "<section><h2>Wi-Fi 設定</h2><form id=f>"
 "<label>Tab5 のアクセスポイントのパスワード（8〜63文字。空欄なら変えない）</label>"
 "<input name=ap_pass type=password autocomplete=new-password>"
@@ -71,7 +78,7 @@ static const char PAGE[] =
 "r+=row('UVC カメラ',s.uvc.on?s.uvc.w+'x'+s.uvc.h+'、'+fps(s.uvc.dec,p&&p.uvc.dec):'なし');"
 "r+=row('画面表示',fps(s.disp,p&&p.disp));"
 "const R=s.rec;r+=row('録画',R.state=='rec'?'<span class=rec>● 録画中</span> '+R.file+' '+mm(R.sec)+"
-"'（コマ落ち '+R.drop+'、音声欠け '+R.adrop+'）':{idle:'停止中',nocard:'SD カードがありません',error:'書き込みエラーで停止'}[R.state]);"
+"'（コマ落ち '+R.drop+'、音声欠け '+R.adrop+'）':{idle:'停止中',nocard:'SD カードがありません',error:'書き込みエラーで停止',full:'ファイル番号が上限（R9999）です'}[R.state]);"
 "const W=s.wifi;r+=row('アクセスポイント',esc(W.ap_ssid)+'（'+W.ap_ip+'、接続 '+W.ap_clients+' 台）');"
 "r+=row('接続先',!W.sta?'設定なし':esc(W.sta_ssid)+(W.sta_conn?'：'+W.sta_ip+'（'+W.rssi+' dBm、ch'+W.ch+'）':'：接続を試みています'));"
 "r+=row('C6 ファーム',W.c6||'-');"
@@ -133,15 +140,7 @@ static void url_decode(char *s)
 
 static bool valid_rec_name(const char *name)
 {
-    if (strlen(name) != 9 || name[0] != 'R' || strcmp(name + 5, ".AVI") != 0) {
-        return false;
-    }
-    for (int i = 1; i < 5; i++) {
-        if (name[i] < '0' || name[i] > '9') {
-            return false;
-        }
-    }
-    return true;
+    return recorder_parse_name(name, NULL);
 }
 
 /* Name of the file being written, or "" when not recording. */
@@ -186,7 +185,7 @@ static esp_err_t status_get(httpd_req_t *req)
     net_status_t net;
     net_wifi_get_status(&net);
 
-    static const char *const rec_state[] = { "idle", "rec", "nocard", "error" };
+    static const char *const rec_state[] = { "idle", "rec", "nocard", "error", "full" };
     char ssid[3 * 33 + 8];
     json_escape(ssid, sizeof(ssid), net.sta_ssid);
     char c6[24];
@@ -294,16 +293,21 @@ static void download_task(void *arg)
         send_text(req, "503 Service Unavailable", "SD カードがありません");
         goto done;
     }
-    FILE *f = fopen(path, "rb");
+    /* read(), not stdio: an unbuffered fread() ran at 75 KB/s against 14.7 MB/s
+     * for read() on the same card (2026-11-07). */
+    int fd = open(path, O_RDONLY);
     struct stat st;
-    if (!f || fstat(fileno(f), &st) != 0) {
-        if (f) fclose(f);
+    if (fd < 0 || fstat(fd, &st) != 0) {
+        if (fd >= 0) close(fd);
         recorder_card_release();
         send_text(req, "404 Not Found", "ファイルがありません");
         goto done;
     }
-    setvbuf(f, NULL, _IONBF, 0);    /* whole-chunk reads go straight to the card */
     int one = 1;
+    atomic_store(&s_dl_fd, httpd_req_to_sockfd(req));
+    if (atomic_load(&s_dl_abort)) {     /* stop arrived before the socket was published */
+        shutdown(httpd_req_to_sockfd(req), SHUT_RDWR);
+    }
     setsockopt(httpd_req_to_sockfd(req), IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
     char hdr[256];
     int len = snprintf(hdr, sizeof(hdr),
@@ -312,15 +316,15 @@ static void download_task(void *arg)
                        (long)st.st_size, s_dl_name);
     ok = send_all(req, hdr, len);
     while (ok && sent < (size_t)st.st_size) {
-        size_t n = fread(s_dl_buf, 1, SEND_CHUNK, f);
-        if (n == 0) {
+        int n = read(fd, s_dl_buf, SEND_CHUNK);
+        if (n <= 0) {
             ok = false;
             break;
         }
         ok = send_all(req, s_dl_buf, n);
         sent += ok ? n : 0;
     }
-    fclose(f);
+    close(fd);
     recorder_card_release();
     int64_t us = esp_timer_get_time() - t0;
     if (ok) {
@@ -333,7 +337,9 @@ static void download_task(void *arg)
     }
 done:
     httpd_req_async_handler_complete(req);
+    atomic_store(&s_dl_fd, -1);
     atomic_store(&s_dl_busy, false);
+    xSemaphoreGive(s_dl_done);      /* web_server_stop() may now free the server */
     vTaskDelete(NULL);
 }
 
@@ -363,10 +369,12 @@ static esp_err_t rec_get(httpd_req_t *req)
     }
     strlcpy(s_dl_name, clean, sizeof(s_dl_name));
     atomic_store(&s_dl_abort, false);
+    xSemaphoreTake(s_dl_done, 0);   /* clear a stale completion */
     if (xTaskCreate(download_task, "web_dl", 4096, copy, APP_WEB_PRIO, NULL) != pdPASS) {
         send_text(copy, "500 Internal Server Error", "開始できませんでした");
         httpd_req_async_handler_complete(copy);
         atomic_store(&s_dl_busy, false);
+        xSemaphoreGive(s_dl_done);
     }
     return ESP_OK;
 }
@@ -425,6 +433,18 @@ esp_err_t web_server_start(void)
     if (s_server) {
         return ESP_OK;
     }
+    if (!s_dl_buf) {
+        s_dl_buf = heap_caps_aligned_alloc(64, SEND_CHUNK, MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);
+        if (!s_dl_buf) {
+            return ESP_ERR_NO_MEM;
+        }
+    }
+    if (!s_dl_done) {
+        s_dl_done = xSemaphoreCreateBinary();
+        if (!s_dl_done) {
+            return ESP_ERR_NO_MEM;
+        }
+    }
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
     cfg.stack_size = APP_WEB_STACK;
     cfg.task_priority = APP_WEB_PRIO;
@@ -456,10 +476,20 @@ void web_server_stop(void)
     if (!s_server) {
         return;
     }
-    /* A running download holds a request of this server: let it finish first. */
-    atomic_store(&s_dl_abort, true);
-    for (int i = 0; i < 50 && atomic_load(&s_dl_busy); i++) {
-        vTaskDelay(pdMS_TO_TICKS(100));
+    /* A running download owns an async request of this server: the server may be
+     * freed only after the download task has completed it. Shutting the socket
+     * down ends a send that is blocked on a stalled client. */
+    if (atomic_load(&s_dl_busy)) {
+        atomic_store(&s_dl_abort, true);
+        int fd = atomic_load(&s_dl_fd);
+        if (fd >= 0) {
+            shutdown(fd, SHUT_RDWR);
+        }
+        if (xSemaphoreTake(s_dl_done, pdMS_TO_TICKS(15000)) != pdTRUE) {
+            /* Never free a server that a task may still use: keep it running. */
+            ESP_LOGE(TAG, "download did not finish; web server left running");
+            return;
+        }
     }
     httpd_stop(s_server);
     s_server = NULL;

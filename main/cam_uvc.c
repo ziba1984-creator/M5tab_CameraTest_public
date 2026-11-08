@@ -44,6 +44,11 @@ static frame_mbox_t s_mbox;
 static uint8_t *s_out[APP_UVC_OUT_BUFS];
 static size_t s_out_cap;
 static cam_uvc_stats_t s_stats;
+
+/* Statistics are written by several tasks and copied whole by the getter;
+ * every access goes through this short critical section (64-bit fields included). */
+static portMUX_TYPE s_stats_mux = portMUX_INITIALIZER_UNLOCKED;
+#define STATS(stmt) do { taskENTER_CRITICAL(&s_stats_mux); stmt; taskEXIT_CRITICAL(&s_stats_mux); } while (0)
 static volatile TickType_t s_last_rx;   /* tick of the last received frame (stall watchdog) */
 static int s_open_failures;             /* consecutive failed opens of a present camera */
 
@@ -82,12 +87,11 @@ static void on_stream_event(const uvc_host_stream_event_data_t *event, void *ctx
 
 static bool on_frame(const uvc_host_frame_t *frame, void *ctx)
 {
-    s_stats.rx_frames++;
-    s_stats.rx_bytes += frame->data_len;
+    STATS(s_stats.rx_frames++; s_stats.rx_bytes += frame->data_len);
     s_last_rx = xTaskGetTickCount();
     rx_item_t item = { .frame = frame, .gen = s_gen };
     if (xQueueSendToBack(s_rx_q, &item, 0) != pdPASS) {
-        s_stats.rx_dropped++;
+        STATS(s_stats.rx_dropped++);
         return true;        /* not queued: hand the buffer straight back to the driver */
     }
     return false;           /* decode task returns it with uvc_host_frame_return() */
@@ -122,23 +126,27 @@ static void decode_and_publish(const uvc_host_frame_t *f)
 {
     int idx;
     if (xQueueReceive(s_out_free_q, &idx, 0) != pdTRUE) {
-        s_stats.no_buffer++;
+        STATS(s_stats.no_buffer++);
         return;
     }
     jpeg_dec_result_t r;
     int64_t t0 = esp_timer_get_time();
     esp_err_t err = jpeg_dec_decode(f->data, f->data_len, s_out[idx], s_out_cap, &r);
-    s_stats.decode_us += (uint32_t)(esp_timer_get_time() - t0);
+    uint32_t dec_us = (uint32_t)(esp_timer_get_time() - t0);
+    STATS(s_stats.decode_us += dec_us);
     if (err != ESP_OK) {
-        if ((s_stats.decode_errors++ % 30) == 0) {
+        uint32_t errors;
+        STATS(errors = s_stats.decode_errors++);
+        if ((errors % 30) == 0) {
             ESP_LOGW(TAG, "JPEG decode failed (%s), %u bytes", esp_err_to_name(err), (unsigned)f->data_len);
         }
         xQueueSend(s_out_free_q, &idx, 0);
         return;
     }
-    s_stats.decoded++;
+    STATS(s_stats.decoded++);
 #if APP_UVC_CTRL_TEST
-    s_stats.luma = sample_luma(s_out[idx], r.w, r.h, r.stride);
+    uint8_t luma = sample_luma(s_out[idx], r.w, r.h, r.stride);
+    STATS(s_stats.luma = luma);
 #endif
     video_frame_t out = {
         .data = s_out[idx],
@@ -154,14 +162,23 @@ static void decode_task(void *arg)
 {
     for (;;) {
         rx_item_t item;
-        if (xQueueReceive(s_rx_q, &item, portMAX_DELAY) != pdTRUE) {
+        /* Wait without taking the frame, then take it only while holding s_lock.
+         * close_stream() drains the queue under the same lock, so every frame is
+         * either still queued (close_stream returns it) or taken here under the
+         * lock (returned here before close_stream can run): none can be lost
+         * between the two. */
+        if (xQueuePeek(s_rx_q, &item, portMAX_DELAY) != pdTRUE) {
             continue;
         }
         xSemaphoreTake(s_lock, portMAX_DELAY);
-        /* A frame of an already closed stream must not be touched (its memory is gone). */
-        if (s_stream && item.gen == s_gen) {
-            decode_and_publish(item.frame);
-            uvc_host_frame_return(s_stream, (uvc_host_frame_t *)item.frame);
+        if (xQueueReceive(s_rx_q, &item, 0) == pdTRUE) {
+            if (s_stream && item.gen == s_gen) {
+                decode_and_publish(item.frame);
+                uvc_host_frame_return(s_stream, (uvc_host_frame_t *)item.frame);
+            } else {
+                /* Cannot happen while close_stream() drains under s_lock; keep it loud. */
+                ESP_LOGE(TAG, "frame of a closed stream left in the queue");
+            }
         }
         xSemaphoreGive(s_lock);
     }
@@ -320,8 +337,7 @@ static esp_err_t try_open(uint8_t addr, uint8_t idx)
     uvc_host_stream_format_t actual = { 0 };
     if (uvc_host_stream_format_get(hdl, &actual) == ESP_OK) {
         ESP_LOGI(TAG, "camera accepted %ux%u @ %.1f fps", actual.h_res, actual.v_res, actual.fps);
-        s_stats.w = actual.h_res;
-        s_stats.h = actual.v_res;
+        STATS(s_stats.w = actual.h_res; s_stats.h = actual.v_res);
     }
 #if APP_UVC_CTRL_PROBE
     /* Before streaming starts, so the control transfers cannot disturb it. */
@@ -344,7 +360,7 @@ static esp_err_t try_open(uint8_t addr, uint8_t idx)
         return ret;
     }
     s_last_rx = xTaskGetTickCount();
-    s_stats.streaming = true;
+    STATS(s_stats.streaming = true);
     ESP_LOGI(TAG, "streaming");
     return ESP_OK;
 }
@@ -390,7 +406,7 @@ static void close_stream(void)
         ESP_LOGI(TAG, "returned %u queued frame(s) before close", returned);
     }
 
-    s_stats.streaming = false;
+    STATS(s_stats.streaming = false);
     cam_uvc_ctrl_forget();
     if (hdl) {
         esp_err_t err = uvc_host_stream_close(hdl);
@@ -406,7 +422,7 @@ static void close_stream(void)
 static void power_cycle_camera(const char *why)
 {
     ESP_LOGW(TAG, "%s: power-cycling the USB-A port", why);
-    s_stats.power_cycles++;
+    STATS(s_stats.power_cycles++);
     s_open_failures = 0;
     close_stream();
     bsp_feature_enable(BSP_FEATURE_USB, false);
@@ -478,7 +494,7 @@ static void manager_task(void *arg)
         } else if (!s_stream) {
             scan_and_open();    /* safety net for missed connect events */
         } else if (stream_stalled()) {
-            s_stats.stall_restarts++;
+            STATS(s_stats.stall_restarts++);
             power_cycle_camera("no frame for " STR(APP_UVC_STALL_MS) " ms");
         }
         if (cycle_pending && (int32_t)(xTaskGetTickCount() - cycle_at) >= 0) {
@@ -552,5 +568,5 @@ esp_err_t cam_uvc_start(void)
 
 void cam_uvc_get_stats(cam_uvc_stats_t *out)
 {
-    *out = s_stats;
+    STATS(*out = s_stats);
 }

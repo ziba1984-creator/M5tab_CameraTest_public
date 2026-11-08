@@ -64,6 +64,7 @@
 #define APP_REC_DIR             "/sdcard/REC"
 #define APP_REC_QUALITY         70      /* JPEG quality 1..100 */
 #define APP_REC_SEGMENT_S       300     /* start a new file after this many seconds */
+#define APP_REC_MAX_NO          9999    /* R0001..R9999.AVI; recording refuses to start beyond */
 #define APP_REC_VIDEO_SLOTS     12      /* encoded frames waiting for the card (~0.4 s at 30 fps) */
 #define APP_REC_VIDEO_SLOT_KB   192     /* largest JPEG frame accepted */
 #define APP_REC_AUDIO_RATE      16000

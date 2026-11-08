@@ -45,6 +45,7 @@ static esp_netif_t *s_sta_netif, *s_ap_netif;
 
 static atomic_bool s_running;           /* between esp_wifi_start and esp_wifi_stop */
 static atomic_llong s_retry_at;         /* next station connect attempt (us), 0 = none */
+static atomic_bool s_apply_pending;     /* saved settings not yet applied to running Wi-Fi */
 
 static void set_state(net_state_t state)
 {
@@ -134,6 +135,9 @@ esp_err_t net_wifi_save_settings(const char *ap_pass, const char *sta_ssid, cons
         return err;
     }
     ESP_LOGI(TAG, "settings saved (station: %s)", next.sta_ssid[0] ? "configured" : "none");
+    /* The flag is what counts: the task checks it at least once a second, so a
+     * full command queue only delays the restart. Several saves merge into one. */
+    atomic_store(&s_apply_pending, true);
     const net_cmd_t cmd = CMD_APPLY;
     xQueueSend(s_cmd, &cmd, 0);
     return ESP_OK;
@@ -355,15 +359,21 @@ static void net_task(void *arg)
                 turn_off();
                 break;
             case CMD_APPLY:
-                if (atomic_load(&s_running)) {
-                    vTaskDelay(pdMS_TO_TICKS(APP_WIFI_APPLY_DELAY_MS));
-                    stop_wifi();
-                    if (start_wifi() != ESP_OK) {
-                        web_server_stop();
-                        set_state(NET_FAILED);
-                    }
+                break;      /* only a wake-up; s_apply_pending carries the request */
+            }
+        }
+        if (atomic_load(&s_apply_pending)) {
+            if (atomic_load(&s_running)) {
+                vTaskDelay(pdMS_TO_TICKS(APP_WIFI_APPLY_DELAY_MS));
+                /* Cleared before the restart: a save during it triggers one more. */
+                atomic_store(&s_apply_pending, false);
+                stop_wifi();
+                if (start_wifi() != ESP_OK) {
+                    web_server_stop();
+                    set_state(NET_FAILED);
                 }
-                break;
+            } else {
+                atomic_store(&s_apply_pending, false);  /* the next start reads the saved settings */
             }
         }
         int64_t at = atomic_load(&s_retry_at);
@@ -421,3 +431,4 @@ void net_wifi_get_status(net_status_t *out)
     *out = s_st;
     xSemaphoreGive(s_lock);
 }
+

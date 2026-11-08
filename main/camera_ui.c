@@ -112,6 +112,7 @@ static void glyph_rows(char ch, uint8_t row[7])
     static const uint8_t e[7] = {31,16,16,30,16,16,31};
     static const uint8_t f[7] = {31,16,16,30,16,16,16};
     static const uint8_t i[7] = {14,4,4,4,4,4,14};
+    static const uint8_t l[7] = {16,16,16,16,16,16,31};
     static const uint8_t n[7] = {17,25,21,19,17,17,17};
     static const uint8_t o[7] = {14,17,17,17,17,17,14};
     static const uint8_t p[7] = {30,17,17,30,16,16,16};
@@ -128,7 +129,7 @@ static void glyph_rows(char ch, uint8_t row[7])
     switch (ch) {
     case 'A': src = a; break; case 'B': src = b; break; case 'C': src = c; break;
     case 'D': src = d; break; case 'E': src = e; break; case 'F': src = f; break;
-    case 'I': src = i; break; case 'N': src = n; break; case 'O': src = o; break; case 'P': src = p; break;
+    case 'I': src = i; break; case 'L': src = l; break; case 'N': src = n; break; case 'O': src = o; break; case 'P': src = p; break;
     case 'R': src = r; break; case 'S': src = s; break; case 'T': src = t; break;
     case 'U': src = u; break; case 'V': src = v; break; case 'W': src = w; break;
     case '+': src = plus; break; case '-': src = minus; break; case ':': src = colon; break;
@@ -214,6 +215,8 @@ static void render_rec(uint16_t *px)
         snprintf(text, sizeof(text), "%" PRIu32 ":%02" PRIu32, s_rec.seconds / 60 % 100, s_rec.seconds % 60);
     } else if (s_rec.state == RECORDER_NO_CARD) {
         snprintf(text, sizeof(text), "NOSD");
+    } else if (s_rec.state == RECORDER_FULL) {
+        snprintf(text, sizeof(text), "FULL");
     } else if (s_rec.state == RECORDER_ERROR) {
         snprintf(text, sizeof(text), "ERR");
     }

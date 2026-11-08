@@ -1,7 +1,10 @@
+#include <errno.h>
+#include <fcntl.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 #include "esp_check.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
@@ -157,10 +160,15 @@ esp_err_t avi_open(const char *path, const avi_config_t *cfg, avi_writer_t **out
     avi_writer_t *avi = calloc(1, sizeof(*avi));
     ESP_RETURN_ON_FALSE(avi, ESP_ERR_NO_MEM, TAG, "no memory");
     avi->cfg = *cfg;
-    avi->f = fopen(path, "wb");
+    /* O_EXCL: never truncate an existing file, whatever the caller's numbering does. */
+    int fd = open(path, O_WRONLY | O_CREAT | O_EXCL, 0644);
+    avi->f = fd >= 0 ? fdopen(fd, "wb") : NULL;
     if (!avi->f) {
+        if (fd >= 0) {
+            close(fd);
+        }
         free(avi);
-        ESP_LOGE(TAG, "cannot create %s", path);
+        ESP_LOGE(TAG, "cannot create %s (errno %d)", path, errno);
         return ESP_FAIL;
     }
     if (cfg->io_buf) {

@@ -13,6 +13,7 @@ typedef enum {
     RECORDER_RECORDING,
     RECORDER_NO_CARD,       /* last start found no usable card */
     RECORDER_ERROR,         /* last recording stopped on a write error */
+    RECORDER_FULL,          /* file numbers used up (R9999.AVI exists) */
 } recorder_state_t;
 
 typedef struct {
@@ -37,6 +38,9 @@ esp_err_t recorder_start(void);
 void recorder_stop(void);
 
 void recorder_get_stats(recorder_stats_t *out);
+
+/* Exactly "Rnnnn.AVI" with four digits; the number is stored in *no (may be NULL). */
+bool recorder_parse_name(const char *name, uint32_t *no);
 
 /* For readers outside the recorder (the web page). True: the card is mounted
  * under BSP_SD_MOUNT_POINT and stays mounted until recorder_card_release().

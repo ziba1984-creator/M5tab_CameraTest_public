@@ -62,6 +62,11 @@ static int64_t s_seg_first_us, s_seg_last_us;
 
 /* Written by the tasks without locking; readers only need approximate values. */
 static recorder_stats_t s_stats;
+
+/* Statistics are written by several tasks and copied whole by the getter;
+ * every access goes through this short critical section (64-bit fields included). */
+static portMUX_TYPE s_stats_mux = portMUX_INITIALIZER_UNLOCKED;
+#define STATS(stmt) do { taskENTER_CRITICAL(&s_stats_mux); stmt; taskEXIT_CRITICAL(&s_stats_mux); } while (0)
 static int64_t s_start_us;
 
 /* ---- card and files ---------------------------------------------------------- */
@@ -88,6 +93,26 @@ static bool mount_card(void)
     return true;
 }
 
+bool recorder_parse_name(const char *name, uint32_t *no)
+{
+    /* Checked character by character: sscanf("R%4u.AVI") also accepts R10000.AVI
+     * (as 1000) and anything after the digits. */
+    if (strlen(name) != 9 || name[0] != 'R' || strcmp(name + 5, ".AVI") != 0) {
+        return false;
+    }
+    uint32_t n = 0;
+    for (int i = 1; i < 5; i++) {
+        if (name[i] < '0' || name[i] > '9') {
+            return false;
+        }
+        n = n * 10 + (uint32_t)(name[i] - '0');
+    }
+    if (no) {
+        *no = n;
+    }
+    return true;
+}
+
 /* Rnnnn.AVI: continue after the highest number already on the card. */
 static uint32_t next_file_no(void)
 {
@@ -96,8 +121,8 @@ static uint32_t next_file_no(void)
     if (dir) {
         struct dirent *e;
         while ((e = readdir(dir)) != NULL) {
-            unsigned n;
-            if (sscanf(e->d_name, "R%4u.AVI", &n) == 1 && n > max) {
+            uint32_t n;
+            if (recorder_parse_name(e->d_name, &n) && n > max) {
                 max = n;
             }
         }
@@ -108,6 +133,10 @@ static uint32_t next_file_no(void)
 
 static esp_err_t open_file(uint32_t no)
 {
+    if (no > APP_REC_MAX_NO) {
+        ESP_LOGE(TAG, "file numbers used up (R%04d.AVI exists)", APP_REC_MAX_NO);
+        return ESP_ERR_NOT_SUPPORTED;
+    }
     char path[48];
     snprintf(path, sizeof(path), APP_REC_DIR "/R%04" PRIu32 ".AVI", no);
     const avi_config_t cfg = {
@@ -120,7 +149,7 @@ static esp_err_t open_file(uint32_t no)
     };
     ESP_RETURN_ON_ERROR(avi_open(path, &cfg, &s_avi), TAG, "open %s", path);
     s_seg_first_us = s_seg_last_us = 0;
-    s_stats.file_no = no;
+    STATS(s_stats.file_no = no);
     ESP_LOGI(TAG, "recording to %s", path);
     return ESP_OK;
 }
@@ -137,8 +166,10 @@ static esp_err_t close_file(void)
     uint64_t bytes = avi_bytes(s_avi);
     esp_err_t err = avi_close(s_avi, duration);
     s_avi = NULL;
+    uint32_t file_no;
+    STATS(file_no = s_stats.file_no);
     ESP_LOGI(TAG, "closed R%04" PRIu32 ".AVI: %" PRIu32 " frames, %.1f s, %.1f fps, %.1f MB%s",
-             s_stats.file_no, frames, duration / 1e6, duration ? frames * 1e6 / duration : 0.0,
+             file_no, frames, duration / 1e6, duration ? frames * 1e6 / duration : 0.0,
              bytes / 1048576.0, err == ESP_OK ? "" : " (FAILED)");
     return err;
 }
@@ -181,6 +212,12 @@ static void writer_task(void *arg)
                 err = close_file();
                 if (err == ESP_OK) {
                     err = open_file(++s_next_no);
+                    if (err == ESP_ERR_NOT_SUPPORTED) {
+                        stop_sources();
+                        STATS(s_stats.state = RECORDER_FULL);
+                        give_back(&it);
+                        continue;
+                    }
                 }
             }
             if (err == ESP_OK) {
@@ -189,24 +226,23 @@ static void writer_task(void *arg)
                     s_seg_first_us = it.t_us;
                 }
                 s_seg_last_us = it.t_us;
-                s_stats.frames++;
+                STATS(s_stats.frames++);
             }
         } else {
             err = avi_write_audio(s_avi, s_aslot[it.slot], it.len);
-            s_stats.audio_chunks++;
+            STATS(s_stats.audio_chunks++);
         }
         uint32_t ms = (uint32_t)((esp_timer_get_time() - t0) / 1000);
-        if (ms > s_stats.write_ms_max) {
-            s_stats.write_ms_max = ms;
-        }
+        STATS(if (ms > s_stats.write_ms_max) s_stats.write_ms_max = ms);
         give_back(&it);
         if (err != ESP_OK) {
             ESP_LOGE(TAG, "write failed: recording stopped (card full or removed?)");
             stop_sources();
             close_file();
-            s_stats.state = RECORDER_ERROR;
+            STATS(s_stats.state = RECORDER_ERROR);
         } else if (s_avi) {
-            s_stats.bytes = avi_bytes(s_avi);
+            uint64_t bytes = avi_bytes(s_avi);
+            STATS(s_stats.bytes = bytes);
         }
     }
 }
@@ -224,7 +260,7 @@ static void encoder_task(void *arg)
         uint8_t slot;
         if (!atomic_load(&s_active) || xQueueReceive(s_vfree, &slot, 0) != pdTRUE) {
             if (atomic_load(&s_active)) {
-                s_stats.frames_dropped++;
+                STATS(s_stats.frames_dropped++);
             }
             frame_mbox_release(mb, &f);     /* the camera buffer goes straight back */
             continue;
@@ -241,13 +277,11 @@ static void encoder_task(void *arg)
                                              s_vslot[slot], VIDEO_SLOT, &len);
         frame_mbox_release(mb, &f);
         uint32_t us = (uint32_t)(esp_timer_get_time() - t);
-        if (us > s_stats.encode_us_max) {
-            s_stats.encode_us_max = us;
-        }
+        STATS(if (us > s_stats.encode_us_max) s_stats.encode_us_max = us);
         item_t it = { .kind = ITEM_VIDEO, .slot = slot, .len = len, .t_us = t };
         if (err != ESP_OK || xQueueSend(s_writeq, &it, 0) != pdTRUE) {
             xQueueSend(s_vfree, &slot, 0);
-            s_stats.frames_dropped++;
+            STATS(s_stats.frames_dropped++);
         }
     }
 }
@@ -287,7 +321,7 @@ static void audio_task(void *arg)
                 if (have) {
                     xQueueSend(s_afree, &slot, 0);
                 }
-                s_stats.audio_dropped++;
+                STATS(s_stats.audio_dropped++);
             }
         }
         esp_codec_dev_close(s_mic);
@@ -331,7 +365,7 @@ esp_err_t recorder_init(void)
     s_card_mtx = xSemaphoreCreateMutex();
     ESP_RETURN_ON_FALSE(s_card_mtx, ESP_ERR_NO_MEM, TAG, "no memory");
     atomic_store(&s_card, mount_card());
-    s_stats.state = atomic_load(&s_card) ? RECORDER_IDLE : RECORDER_NO_CARD;
+    STATS(s_stats.state = atomic_load(&s_card) ? RECORDER_IDLE : RECORDER_NO_CARD);
 
     ESP_RETURN_ON_FALSE(xTaskCreate(writer_task, "rec_write", APP_TASK_REC_WRITE_STACK, NULL,
                                     APP_TASK_REC_WRITE_PRIO, NULL) == pdPASS &&
@@ -361,10 +395,14 @@ esp_err_t recorder_start(void)
         xSemaphoreGive(s_card_mtx);
     }
     if (!atomic_load(&s_card)) {
-        s_stats.state = RECORDER_NO_CARD;
+        STATS(s_stats.state = RECORDER_NO_CARD);
         return ESP_ERR_NOT_FOUND;
     }
     s_next_no = next_file_no();
+    if (s_next_no > APP_REC_MAX_NO) {
+        STATS(s_stats.state = RECORDER_FULL);
+        return ESP_ERR_NOT_SUPPORTED;
+    }
     if (open_file(s_next_no) != ESP_OK) {
         /* Card removed or full: remount on the next attempt, unless the web page
          * is reading it right now (then the next attempt tries the card again). */
@@ -373,14 +411,15 @@ esp_err_t recorder_start(void)
             atomic_store(&s_card, false);
             xSemaphoreGive(s_card_mtx);
         }
-        s_stats.state = RECORDER_NO_CARD;
+        STATS(s_stats.state = RECORDER_NO_CARD);
         return ESP_FAIL;
     }
-    s_stats.frames = s_stats.frames_dropped = s_stats.audio_chunks = s_stats.audio_dropped = 0;
-    s_stats.bytes = 0;
-    s_stats.encode_us_max = s_stats.write_ms_max = 0;
-    s_start_us = esp_timer_get_time();
-    s_stats.state = RECORDER_RECORDING;
+    STATS(s_stats.frames = s_stats.frames_dropped = s_stats.audio_chunks = s_stats.audio_dropped = 0;
+          s_stats.bytes = 0;
+          s_stats.encode_us_max = s_stats.write_ms_max = 0);
+    int64_t now = esp_timer_get_time();
+    STATS(s_start_us = now);
+    STATS(s_stats.state = RECORDER_RECORDING);
     atomic_store(&s_active, true);
     if (s_mic) {
         xSemaphoreGive(s_audio_go);
@@ -401,20 +440,20 @@ void recorder_stop(void)
         xSemaphoreTake(s_stopped, pdMS_TO_TICKS(5000)) != pdTRUE) {
         ESP_LOGE(TAG, "the writer did not finish the file");
     }
-    if (s_stats.state == RECORDER_RECORDING) {
-        s_stats.state = RECORDER_IDLE;
-    }
+    STATS(if (s_stats.state == RECORDER_RECORDING) s_stats.state = RECORDER_IDLE);
+    recorder_stats_t st;
+    recorder_get_stats(&st);
     ESP_LOGI(TAG, "stopped: %" PRIu32 " frames (%" PRIu32 " dropped), %" PRIu32 " audio chunks (%" PRIu32
                   " dropped), longest write %" PRIu32 " ms, longest encode %" PRIu32 " us",
-             s_stats.frames, s_stats.frames_dropped, s_stats.audio_chunks, s_stats.audio_dropped,
-             s_stats.write_ms_max, s_stats.encode_us_max);
+             st.frames, st.frames_dropped, st.audio_chunks, st.audio_dropped, st.write_ms_max, st.encode_us_max);
 }
 
 void recorder_get_stats(recorder_stats_t *out)
 {
-    *out = s_stats;
-    out->seconds = s_stats.state == RECORDER_RECORDING
-                   ? (uint32_t)((esp_timer_get_time() - s_start_us) / 1000000) : 0;
+    int64_t start;
+    STATS(*out = s_stats; start = s_start_us);
+    out->seconds = out->state == RECORDER_RECORDING
+                   ? (uint32_t)((esp_timer_get_time() - start) / 1000000) : 0;
 }
 
 bool recorder_card_acquire(TickType_t wait)
