@@ -11,6 +11,7 @@
 #include "esp_http_server.h"
 #include "esp_log.h"
 #include "esp_netif.h"
+#include "esp_random.h"
 #include "esp_timer.h"
 #include "esp_vfs_fat.h"
 #include "freertos/FreeRTOS.h"
@@ -30,6 +31,10 @@ static const char *TAG = "web";
 
 #define SETTINGS_BODY_MAX   512
 #define DELETE_BODY_MAX     4096    /* newline-separated Rnnnn.AVI names */
+#define TOKEN_LEN           32      /* hex characters of the per-boot request token */
+#define PAGE_TOKEN_MARK     "@@TOKEN@@"
+
+static char s_token[TOKEN_LEN + 1];   /* set once by web_server_start() */
 #define SEND_CHUNK          (APP_WEB_SEND_KB * 1024)
 
 static httpd_handle_t s_server;
@@ -81,6 +86,7 @@ static const char PAGE[] =
 "<input name=sta_pass type=password autocomplete=new-password>"
 "<button>保存</button><span id=msg></span></form>"
 "<small>保存すると Wi-Fi が一度切れます。つなぎ直してください。</small></section><script>"
+"const TK='" PAGE_TOKEN_MARK "';"   /* replaced by the per-boot token when served */
 "const $=i=>document.getElementById(i);let P=null,ssidSet=false;"
 "const row=(k,v)=>'<tr><th>'+k+'</th><td>'+v+'</td></tr>';"
 "const esc=s=>String(s).replace(/[&<>\"']/g,c=>'&#'+c.charCodeAt(0)+';');"
@@ -116,14 +122,14 @@ static const char PAGE[] =
 "const mb=s.reduce((a,c)=>a+ +c.dataset.s,0)/1048576;"
 "if(!confirm(s.length+' 件（合計 '+mb.toFixed(1)+' MB）を SD カードから削除します。\\n元に戻せません。よろしいですか？'))return;"
 "$('dmsg').textContent='削除中…';"
-"try{const r=await fetch('/api/delete',{method:'POST',headers:{'Content-Type':'text/plain'},body:s.map(c=>c.value).join('\\n')});"
+"try{const r=await fetch('/api/delete',{method:'POST',headers:{'Content-Type':'text/plain','X-Tab5-Token':TK},body:s.map(c=>c.value).join('\\n')});"
 "if(!r.ok){$('dmsg').textContent='削除できません：'+await r.text();return}"
 "const d=await r.json();const W={rec:'録画中',dl:'ダウンロード中',gone:'見つからない'};"
 "$('dmsg').textContent=d.deleted+' 件を削除しました（'+(d.freed/1048576).toFixed(1)+' MB）'+"
 "(d.skipped.length?'。削除しなかったもの：'+d.skipped.map(k=>k.n+'（'+W[k.why]+'）').join('、'):'')}"
 "catch(e){$('dmsg').textContent='送信できませんでした'}files()}"
 "$('f').onsubmit=async e=>{e.preventDefault();$('msg').textContent='保存中…';"
-"try{const r=await fetch('/api/settings',{method:'POST',body:new URLSearchParams(new FormData($('f')))});"
+"try{const r=await fetch('/api/settings',{method:'POST',headers:{'X-Tab5-Token':TK},body:new URLSearchParams(new FormData($('f')))});"
 "$('msg').textContent=r.ok?'保存しました。Wi-Fi を再起動します。':'保存できません：'+await r.text()}"
 "catch(e){$('msg').textContent='送信できませんでした'}};"
 "status();files();setInterval(status,2000);"
@@ -193,11 +199,49 @@ static esp_err_t send_text(httpd_req_t *req, const char *status, const char *tex
 
 /* ---- handlers ------------------------------------------------------------------ */
 
+/* The page carries the per-boot token in place of PAGE_TOKEN_MARK. */
 static esp_err_t page_get(httpd_req_t *req)
 {
     httpd_resp_set_type(req, "text/html; charset=utf-8");
     httpd_resp_set_hdr(req, "Cache-Control", "no-store");
-    return httpd_resp_send(req, PAGE, sizeof(PAGE) - 1);
+    const char *mark = strstr(PAGE, PAGE_TOKEN_MARK);
+    if (!mark) {
+        return httpd_resp_send_500(req);
+    }
+    esp_err_t err = httpd_resp_send_chunk(req, PAGE, mark - PAGE);
+    if (err == ESP_OK) err = httpd_resp_send_chunk(req, s_token, HTTPD_RESP_USE_STRLEN);
+    if (err == ESP_OK) err = httpd_resp_send_chunk(req, mark + strlen(PAGE_TOKEN_MARK), HTTPD_RESP_USE_STRLEN);
+    if (err == ESP_OK) err = httpd_resp_send_chunk(req, NULL, 0);
+    return err;
+}
+
+/* Changing requests (delete, settings) must come from this device's own page:
+ * the per-boot token travels in a custom header, which a page of another origin
+ * can only send after a CORS preflight that this server never answers; and a
+ * browser's Origin, when present, must be this host. The confirmation dialog
+ * stays a convenience, not the protection. */
+static bool request_allowed(httpd_req_t *req)
+{
+    char got[sizeof(s_token)] = "";
+    if (httpd_req_get_hdr_value_str(req, "X-Tab5-Token", got, sizeof(got)) != ESP_OK ||
+        strlen(got) != TOKEN_LEN) {
+        return false;
+    }
+    unsigned diff = 0;
+    for (int i = 0; i < TOKEN_LEN; i++) {
+        diff |= (unsigned)(got[i] ^ s_token[i]);
+    }
+    if (diff) {
+        return false;
+    }
+    char origin[96], host[80];
+    if (httpd_req_get_hdr_value_str(req, "Origin", origin, sizeof(origin)) == ESP_OK) {
+        if (httpd_req_get_hdr_value_str(req, "Host", host, sizeof(host)) != ESP_OK ||
+            strncmp(origin, "http://", 7) != 0 || strcmp(origin + 7, host) != 0) {
+            return false;
+        }
+    }
+    return true;
 }
 
 static esp_err_t status_get(httpd_req_t *req)
@@ -374,10 +418,13 @@ static void download_task(void *arg)
         ok = send_all(req, s_dl_buf, n);
         sent += ok ? n : 0;
     }
-    if (recorder_card_acquire(pdMS_TO_TICKS(10000))) {
+    /* Wait as long as it takes: a busy card (a long delete, say) must not leak the
+     * descriptor (max_files is 4). With portMAX_DELAY, false means unmounted only,
+     * and then the descriptor went away with the card. */
+    if (recorder_card_acquire(portMAX_DELAY)) {
         close(fd);
         recorder_card_release();
-    }       /* else the card was unmounted and the descriptor is gone with it */
+    }
     int64_t us = esp_timer_get_time() - t0;
     if (ok) {
         ESP_LOGI(TAG, "download %s: %u KB in %" PRId64 " ms = %.2f Mbit/s", s_dl_name, (unsigned)(sent / 1024),
@@ -443,6 +490,10 @@ static esp_err_t rec_get(httpd_req_t *req)
  * downloaded; reports each refusal. */
 static esp_err_t delete_post(httpd_req_t *req)
 {
+    if (!request_allowed(req)) {
+        ESP_LOGW(TAG, "delete refused: missing or wrong token, or foreign origin");
+        return send_text(req, "403 Forbidden", "このページから操作してください（ページを再読み込みしてください）");
+    }
     if (req->content_len == 0 || req->content_len > DELETE_BODY_MAX) {
         return send_text(req, "400 Bad Request", "削除するファイルの指定が不正です");
     }
@@ -522,6 +573,10 @@ static esp_err_t delete_post(httpd_req_t *req)
 
 static esp_err_t settings_post(httpd_req_t *req)
 {
+    if (!request_allowed(req)) {
+        ESP_LOGW(TAG, "settings refused: missing or wrong token, or foreign origin");
+        return send_text(req, "403 Forbidden", "このページから操作してください（ページを再読み込みしてください）");
+    }
     if (req->content_len == 0 || req->content_len > SETTINGS_BODY_MAX) {
         return send_text(req, "400 Bad Request", "入力が長すぎます");
     }
@@ -594,6 +649,13 @@ esp_err_t web_server_start(void)
     }
     if (!s_dl_done || !s_dl_mtx) {
         return ESP_ERR_NO_MEM;
+    }
+    if (!s_token[0]) {      /* once per boot: pages loaded before a reboot stop working */
+        uint8_t rnd[TOKEN_LEN / 2];
+        esp_fill_random(rnd, sizeof(rnd));
+        for (int i = 0; i < (int)sizeof(rnd); i++) {
+            snprintf(s_token + 2 * i, 3, "%02x", rnd[i]);
+        }
     }
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
     cfg.stack_size = APP_WEB_STACK;
