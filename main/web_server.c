@@ -29,6 +29,7 @@
 static const char *TAG = "web";
 
 #define SETTINGS_BODY_MAX   512
+#define DELETE_BODY_MAX     4096    /* newline-separated Rnnnn.AVI names */
 #define SEND_CHUNK          (APP_WEB_SEND_KB * 1024)
 
 static httpd_handle_t s_server;
@@ -69,6 +70,7 @@ static const char PAGE[] =
 "</style><h1>Tab5 Camera</h1>"
 "<section><h2>状態</h2><table id=st><tr><td>読み込み中…</td></tr></table></section>"
 "<section><h2>録画ファイル</h2><p id=card></p><table id=files></table>"
+"<button id=del onclick=del() disabled>選択したファイルを削除</button> <span id=dmsg></span><br>"
 "<button onclick=files()>一覧を更新</button><br><small>ダウンロードは1本ずつ、速さは約0.9MB/秒です"
 "（5分の録画で約4分）。録画中のファイルはダウンロードできません。</small></section>"
 "<section><h2>Wi-Fi 設定</h2><form id=f>"
@@ -101,9 +103,25 @@ static const char PAGE[] =
 "if(!d.card){$('card').textContent='SD カードがありません';t.innerHTML='';return}"
 "$('card').textContent='空き '+(d.free/1073741824).toFixed(1)+' GB／'+(d.total/1073741824).toFixed(1)+' GB';"
 "d.files.sort((a,b)=>b.n.localeCompare(a.n));"
-"t.innerHTML=d.files.length?d.files.map(f=>'<tr><td>'+(f.n==d.active?f.n+' <span class=rec>録画中</span>':"
-"'<a href=\"/rec/'+f.n+'\" download>'+f.n+'</a>')+'</td><td>'+(f.s/1048576).toFixed(1)+' MB</td></tr>').join('')"
-":'<tr><td>録画ファイルはありません</td></tr>'}catch(e){t.innerHTML='<tr><td>読み込めませんでした</td></tr>'}}"
+"t.innerHTML=d.files.length?'<tr><th style=width:2em><input type=checkbox id=all onchange=selAll(this.checked)></th>"
+"<th>すべて選択</th><th></th></tr>'+d.files.map(f=>{const a=f.n==d.active;"
+"return '<tr><td><input type=checkbox class=sel value='+f.n+' data-s='+f.s+(a?' disabled':'')+' onchange=selUpd()></td><td>'+"
+"(a?f.n+' <span class=rec>録画中</span>':'<a href=\"/rec/'+f.n+'\" download>'+f.n+'</a>')+"
+"'</td><td>'+(f.s/1048576).toFixed(1)+' MB</td></tr>'}).join('')"
+":'<tr><td>録画ファイルはありません</td></tr>';selUpd()}catch(e){t.innerHTML='<tr><td>読み込めませんでした</td></tr>'}}"
+"const sels=()=>[...document.querySelectorAll('.sel:checked')];"
+"function selAll(v){document.querySelectorAll('.sel:not(:disabled)').forEach(c=>c.checked=v);selUpd()}"
+"function selUpd(){const n=sels().length;$('del').disabled=!n;$('del').textContent=n?'選択した '+n+' 件を削除':'選択したファイルを削除'}"
+"async function del(){const s=sels();if(!s.length)return;"
+"const mb=s.reduce((a,c)=>a+ +c.dataset.s,0)/1048576;"
+"if(!confirm(s.length+' 件（合計 '+mb.toFixed(1)+' MB）を SD カードから削除します。\\n元に戻せません。よろしいですか？'))return;"
+"$('dmsg').textContent='削除中…';"
+"try{const r=await fetch('/api/delete',{method:'POST',headers:{'Content-Type':'text/plain'},body:s.map(c=>c.value).join('\\n')});"
+"if(!r.ok){$('dmsg').textContent='削除できません：'+await r.text();return}"
+"const d=await r.json();const W={rec:'録画中',dl:'ダウンロード中',gone:'見つからない'};"
+"$('dmsg').textContent=d.deleted+' 件を削除しました（'+(d.freed/1048576).toFixed(1)+' MB）'+"
+"(d.skipped.length?'。削除しなかったもの：'+d.skipped.map(k=>k.n+'（'+W[k.why]+'）').join('、'):'')}"
+"catch(e){$('dmsg').textContent='送信できませんでした'}files()}"
 "$('f').onsubmit=async e=>{e.preventDefault();$('msg').textContent='保存中…';"
 "try{const r=await fetch('/api/settings',{method:'POST',body:new URLSearchParams(new FormData($('f')))});"
 "$('msg').textContent=r.ok?'保存しました。Wi-Fi を再起動します。':'保存できません：'+await r.text()}"
@@ -324,6 +342,10 @@ static void download_task(void *arg)
         send_text(req, "404 Not Found", "ファイルがありません");
         goto done;
     }
+    /* The card lock is held only around each card access, not for the whole
+     * transfer, so the file list and deleting keep working during a download.
+     * delete_post() refuses the file being downloaded (s_dl_name). */
+    recorder_card_release();
     int one = 1;
     xSemaphoreTake(s_dl_mtx, portMAX_DELAY);
     s_dl_fd = httpd_req_to_sockfd(req);
@@ -339,7 +361,12 @@ static void download_task(void *arg)
                        (long)st.st_size, s_dl_name);
     ok = send_all(req, hdr, len);
     while (ok && sent < (size_t)st.st_size) {
+        if (!recorder_card_acquire(pdMS_TO_TICKS(10000))) {
+            ok = false;     /* card removed (unmounted) or held too long */
+            break;
+        }
         int n = read(fd, s_dl_buf, SEND_CHUNK);
+        recorder_card_release();
         if (n <= 0) {
             ok = false;
             break;
@@ -347,8 +374,10 @@ static void download_task(void *arg)
         ok = send_all(req, s_dl_buf, n);
         sent += ok ? n : 0;
     }
-    close(fd);
-    recorder_card_release();
+    if (recorder_card_acquire(pdMS_TO_TICKS(10000))) {
+        close(fd);
+        recorder_card_release();
+    }       /* else the card was unmounted and the descriptor is gone with it */
     int64_t us = esp_timer_get_time() - t0;
     if (ok) {
         ESP_LOGI(TAG, "download %s: %u KB in %" PRId64 " ms = %.2f Mbit/s", s_dl_name, (unsigned)(sent / 1024),
@@ -407,6 +436,88 @@ static esp_err_t rec_get(httpd_req_t *req)
         release_download();
     }
     return ESP_OK;
+}
+
+/* POST /api/delete, body: Rnnnn.AVI names separated by newlines. Refuses the file
+ * being recorded (and anything newer while recording) and the file being
+ * downloaded; reports each refusal. */
+static esp_err_t delete_post(httpd_req_t *req)
+{
+    if (req->content_len == 0 || req->content_len > DELETE_BODY_MAX) {
+        return send_text(req, "400 Bad Request", "削除するファイルの指定が不正です");
+    }
+    char *body = malloc(req->content_len + 1);
+    if (!body) {
+        return send_text(req, "500 Internal Server Error", "メモリが足りません");
+    }
+    size_t got = 0;
+    while (got < req->content_len) {
+        int n = httpd_req_recv(req, body + got, req->content_len - got);
+        if (n == HTTPD_SOCK_ERR_TIMEOUT) {
+            continue;
+        }
+        if (n <= 0) {
+            free(body);
+            return ESP_FAIL;
+        }
+        got += n;
+    }
+    body[got] = '\0';
+
+    if (!recorder_card_acquire(pdMS_TO_TICKS(5000))) {
+        free(body);
+        return send_text(req, "503 Service Unavailable", "SD カードがありません");
+    }
+    unsigned deleted = 0;
+    uint64_t freed = 0;
+    char out[1024];
+    int o = snprintf(out, sizeof(out), "{\"skipped\":[");
+    bool first = true;
+    char *save = NULL;
+    for (char *name = strtok_r(body, "\r\n", &save); name; name = strtok_r(NULL, "\r\n", &save)) {
+        uint32_t no;
+        const char *why = NULL;
+        if (!recorder_parse_name(name, &no)) {
+            continue;   /* not a recording name: never touched, not reported */
+        }
+        /* While recording, the current file and any newer number are off limits
+         * (the writer opens the next number by itself). */
+        recorder_stats_t rec;
+        recorder_get_stats(&rec);
+        if (rec.state == RECORDER_RECORDING && no >= rec.file_no) {
+            why = "rec";
+        }
+        if (!why) {
+            xSemaphoreTake(s_dl_mtx, portMAX_DELAY);
+            bool downloading = s_dl_busy && strcmp(s_dl_name, name) == 0;
+            xSemaphoreGive(s_dl_mtx);
+            if (downloading) {
+                why = "dl";
+            }
+        }
+        char path[48];
+        snprintf(path, sizeof(path), APP_REC_DIR "/%.9s", name);
+        if (!why) {
+            struct stat st;
+            long size = stat(path, &st) == 0 ? (long)st.st_size : 0;
+            if (unlink(path) == 0) {
+                deleted++;
+                freed += size;
+                ESP_LOGI(TAG, "deleted %s (%ld bytes)", name, size);
+                continue;
+            }
+            why = "gone";
+        }
+        if (o < (int)sizeof(out) - 40) {
+            o += snprintf(out + o, sizeof(out) - o, "%s{\"n\":\"%.9s\",\"why\":\"%s\"}", first ? "" : ",", name, why);
+            first = false;
+        }
+    }
+    recorder_card_release();
+    free(body);
+    snprintf(out + o, sizeof(out) - o, "],\"deleted\":%u,\"freed\":%" PRIu64 "}", deleted, freed);
+    httpd_resp_set_type(req, "application/json");
+    return httpd_resp_sendstr(req, out);
 }
 
 static esp_err_t settings_post(httpd_req_t *req)
@@ -505,6 +616,7 @@ esp_err_t web_server_start(void)
         { .uri = "/api/files",    .method = HTTP_GET,  .handler = files_get },
         { .uri = "/rec/*",        .method = HTTP_GET,  .handler = rec_get },
         { .uri = "/api/settings", .method = HTTP_POST, .handler = settings_post },
+        { .uri = "/api/delete",   .method = HTTP_POST, .handler = delete_post },
     };
     for (size_t i = 0; i < sizeof(uris) / sizeof(uris[0]); i++) {
         httpd_register_uri_handler(s_server, &uris[i]);
