@@ -6,6 +6,17 @@ dependencies:
   espressif/esp_video:
     version: "~2.0"
     override_path: "../override/esp_video"
+  # Local copy of the USB host library with a patch: program HCCHAR.EC for
+  # high-bandwidth isochronous pipes (see override/espressif__usb/src/hcd_dwc.c, "Local patch").
+  espressif/usb:
+    version: "^1"
+    override_path: "../override/espressif__usb"
+  # Local copy of the UVC driver with patches (search "Local patch"): empty isochronous
+  # packets no longer drop the frame being received (uvc_isoc.c), and isochronous URBs
+  # are no longer capped at one payload (uvc_host.c). Packet statistics: UVC_ISOC_DIAG.
+  espressif/usb_host_uvc:
+    version: "2.4.*"
+    override_path: "../override/espressif__usb_host_uvc"
   # Wi-Fi through the on-board ESP32-C6 (SDIO). Host 2.12.x matches the Tab5
   # factory C6 firmware (1.4.1); do not move to 3.x before the C6 is updated.
   espressif/esp_wifi_remote: "^1.6"

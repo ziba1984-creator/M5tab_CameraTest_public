@@ -21,6 +21,7 @@
 #include "app_config.h"
 #include "avi_writer.h"
 #include "cam_builtin.h"
+#include "cam_uvc.h"
 #include "recorder.h"
 
 static const char *TAG = "recorder";
@@ -55,6 +56,9 @@ static atomic_bool s_active;            /* sources feed the write queue */
 static atomic_bool s_card;              /* microSD mounted; mounted/unmounted by the UI task only */
 static SemaphoreHandle_t s_card_mtx;    /* held by other readers of the card (web page) */
 static uint32_t s_next_no;              /* next file number (UI task, then writer) */
+static atomic_int s_source = RECORDER_SRC_BUILTIN;  /* camera for the next recording (UI task) */
+static atomic_bool s_uvc_active;        /* recording the UVC camera: recorder_push_jpeg() accepts frames */
+static uint16_t s_rec_w, s_rec_h;       /* frame size of the current recording (AVI header) */
 
 /* Owned by the writer task while recording. */
 static avi_writer_t *s_avi;
@@ -140,8 +144,8 @@ static esp_err_t open_file(uint32_t no)
     char path[48];
     snprintf(path, sizeof(path), APP_REC_DIR "/R%04" PRIu32 ".AVI", no);
     const avi_config_t cfg = {
-        .width = APP_CAM_BUILTIN_W,
-        .height = APP_CAM_BUILTIN_H,
+        .width = s_rec_w,
+        .height = s_rec_h,
         .audio_rate = APP_REC_AUDIO_RATE,
         .audio_channels = AUDIO_CHANNELS,
         .io_buf = s_io_buf,
@@ -179,6 +183,7 @@ static esp_err_t close_file(void)
 static void stop_sources(void)
 {
     atomic_store(&s_active, false);
+    atomic_store(&s_uvc_active, false);
     cam_builtin_set_recording(false);
 }
 
@@ -365,7 +370,8 @@ esp_err_t recorder_init(void)
     s_card_mtx = xSemaphoreCreateMutex();
     ESP_RETURN_ON_FALSE(s_card_mtx, ESP_ERR_NO_MEM, TAG, "no memory");
     atomic_store(&s_card, mount_card());
-    STATS(s_stats.state = atomic_load(&s_card) ? RECORDER_IDLE : RECORDER_NO_CARD);
+    STATS(s_stats.state = atomic_load(&s_card) ? RECORDER_IDLE : RECORDER_NO_CARD;
+          s_stats.source = RECORDER_SRC_BUILTIN);
 
     ESP_RETURN_ON_FALSE(xTaskCreate(writer_task, "rec_write", APP_TASK_REC_WRITE_STACK, NULL,
                                     APP_TASK_REC_WRITE_PRIO, NULL) == pdPASS &&
@@ -398,6 +404,20 @@ esp_err_t recorder_start(void)
         STATS(s_stats.state = RECORDER_NO_CARD);
         return ESP_ERR_NOT_FOUND;
     }
+    const recorder_source_t source = atomic_load(&s_source);
+    if (source == RECORDER_SRC_UVC) {
+        cam_uvc_stats_t uvc;
+        cam_uvc_get_stats(&uvc);
+        if (!uvc.streaming || !uvc.w || !uvc.h) {
+            ESP_LOGW(TAG, "UVC camera not streaming: nothing to record");
+            return ESP_ERR_INVALID_STATE;
+        }
+        s_rec_w = uvc.w;
+        s_rec_h = uvc.h;
+    } else {
+        s_rec_w = APP_CAM_BUILTIN_W;
+        s_rec_h = APP_CAM_BUILTIN_H;
+    }
     s_next_no = next_file_no();
     if (s_next_no > APP_REC_MAX_NO) {
         STATS(s_stats.state = RECORDER_FULL);
@@ -424,8 +444,55 @@ esp_err_t recorder_start(void)
     if (s_mic) {
         xSemaphoreGive(s_audio_go);
     }
-    cam_builtin_set_recording(true);
+    if (source == RECORDER_SRC_UVC) {
+        atomic_store(&s_uvc_active, true);
+    } else {
+        cam_builtin_set_recording(true);
+    }
+    ESP_LOGI(TAG, "recording the %s camera (%ux%u)", source == RECORDER_SRC_UVC ? "UVC" : "built-in",
+             s_rec_w, s_rec_h);
     return ESP_OK;
+}
+
+esp_err_t recorder_set_source(recorder_source_t source)
+{
+    if (source != RECORDER_SRC_BUILTIN && source != RECORDER_SRC_UVC) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (atomic_load(&s_active)) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    atomic_store(&s_source, source);
+    STATS(s_stats.source = source);
+    return ESP_OK;
+}
+
+recorder_source_t recorder_get_source(void)
+{
+    return atomic_load(&s_source);
+}
+
+bool recorder_wants_uvc(void)
+{
+    return atomic_load(&s_uvc_active);
+}
+
+void recorder_push_jpeg(const uint8_t *jpeg, size_t len, int64_t t_us)
+{
+    if (!atomic_load(&s_uvc_active)) {
+        return;
+    }
+    uint8_t slot;
+    if (len > VIDEO_SLOT || xQueueReceive(s_vfree, &slot, 0) != pdTRUE) {
+        STATS(s_stats.frames_dropped++);
+        return;
+    }
+    memcpy(s_vslot[slot], jpeg, len);
+    item_t it = { .kind = ITEM_VIDEO, .slot = slot, .len = (uint32_t)len, .t_us = t_us };
+    if (xQueueSend(s_writeq, &it, 0) != pdTRUE) {
+        xQueueSend(s_vfree, &slot, 0);
+        STATS(s_stats.frames_dropped++);
+    }
 }
 
 void recorder_stop(void)

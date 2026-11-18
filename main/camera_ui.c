@@ -12,6 +12,7 @@
 #include "freertos/task.h"
 #include "app_config.h"
 #include "cam_builtin.h"
+#include "cam_uvc.h"
 #include "cam_uvc_ctrl.h"
 #include "camera_ui.h"
 #include "display_comp.h"
@@ -35,6 +36,26 @@ static const char *TAG = "camera_ui";
 #define UI_CENTER_Y     13
 #define UI_NONE         (-1)
 #define UI_EVT_UVC      100     /* queue item: UVC controls appeared or vanished */
+#define UI_EVT_TAB      200     /* queue item: + page index */
+#define UI_EVT_SRC_IN   300     /* settings page: record the built-in camera */
+#define UI_EVT_SRC_UVC  301     /* settings page: record the UVC camera */
+
+/* Tabs and pages are drawn at half resolution like the bar (the display scales by 2). */
+#define UI_TAB_SRC_H    (CAMERA_UI_TAB_HEIGHT / 2)
+#define UI_PAGE_SRC_H   ((720 - CAMERA_UI_TAB_HEIGHT) / 2)
+/* Settings page: the two recording-source buttons (page image coordinates). */
+#define SET_BTN_Y       56
+#define SET_BTN_H       84
+#define SET_BTN_IN_X    20
+#define SET_BTN_UVC_X   330
+#define SET_BTN_W       290
+
+#define COLOR_PAGE_BG   0x0841
+#define COLOR_TAB_BG    0x10a2
+#define COLOR_TAB_ON    0x2b5f  /* selected tab */
+#define COLOR_OPT       0x2104
+#define COLOR_OPT_ON    0x03a6  /* selected option (green) */
+#define COLOR_DIM       0x8410
 
 #define COLOR_BAR       0x18e3
 #define COLOR_GROUP_A   0x2104
@@ -71,6 +92,13 @@ static const int32_t s_uvc_step[UI_GROUPS] = { 8, 6, 16, 500 };
 static uint16_t *s_buf[2];
 static int s_front;
 static video_frame_t s_frame;
+/* Tab strip and page image (PSRAM), double-buffered the same way under s_lock. */
+static uint16_t *s_tab_buf[2], *s_page_buf[2];
+static int s_tab_front, s_page_front;
+static video_frame_t s_tab_frame, s_page_frame;
+static volatile camera_ui_page_t s_page = CAMERA_UI_PAGE_CAMERA;
+static const char *const s_tab_labels[CAMERA_UI_PAGE_COUNT] = { "CAMERA", "MEASURE", "SETTINGS" };
+static cam_uvc_stats_t s_uvc_seen;      /* UVC state as last drawn on the settings page */
 static SemaphoreHandle_t s_lock;
 static QueueHandle_t s_queue;
 
@@ -126,6 +154,16 @@ static void glyph_rows(char ch, uint8_t row[7])
     static const uint8_t minus[7] = {0,0,0,31,0,0,0};
     static const uint8_t colon[7] = {0,4,4,0,4,4,0};
     static const uint8_t dot[7] = {0,0,0,0,0,12,12};
+    static const uint8_t g[7] = {14,17,16,23,17,17,15};
+    static const uint8_t h[7] = {17,17,17,31,17,17,17};
+    static const uint8_t j[7] = {7,2,2,2,2,18,12};
+    static const uint8_t k[7] = {17,18,20,24,20,18,17};
+    static const uint8_t m[7] = {17,27,21,21,17,17,17};
+    static const uint8_t q[7] = {14,17,17,17,21,18,13};
+    static const uint8_t x[7] = {17,17,10,4,10,17,17};
+    static const uint8_t y[7] = {17,17,10,4,4,4,4};
+    static const uint8_t z[7] = {31,1,2,4,8,16,31};
+    static const uint8_t slash[7] = {1,1,2,4,8,16,16};
     switch (ch) {
     case 'A': src = a; break; case 'B': src = b; break; case 'C': src = c; break;
     case 'D': src = d; break; case 'E': src = e; break; case 'F': src = f; break;
@@ -134,6 +172,10 @@ static void glyph_rows(char ch, uint8_t row[7])
     case 'U': src = u; break; case 'V': src = v; break; case 'W': src = w; break;
     case '+': src = plus; break; case '-': src = minus; break; case ':': src = colon; break;
     case '.': src = dot; break;
+    case 'G': src = g; break; case 'H': src = h; break; case 'J': src = j; break;
+    case 'K': src = k; break; case 'M': src = m; break; case 'Q': src = q; break;
+    case 'X': src = x; break; case 'Y': src = y; break; case 'Z': src = z; break;
+    case '/': src = slash; break;
     default:
         if (ch >= '0' && ch <= '9') src = digits[ch - '0'];
         break;
@@ -141,15 +183,21 @@ static void glyph_rows(char ch, uint8_t row[7])
     memcpy(row, src, 7);
 }
 
-static void put_rect(uint16_t *px, int x, int y, int w, int h, uint16_t color)
+/* An RGB565 image being drawn (one of the UI images). */
+typedef struct {
+    uint16_t *px;
+    int w, h;
+} canvas_t;
+
+static void put_rect(canvas_t *c, int x, int y, int w, int h, uint16_t color)
 {
-    if (x < 0 || y < 0 || x + w > UI_SRC_W || y + h > UI_SRC_H) return;
+    if (x < 0 || y < 0 || w <= 0 || h <= 0 || x + w > c->w || y + h > c->h) return;
     for (int yy = y; yy < y + h; yy++) {
-        for (int xx = x; xx < x + w; xx++) px[yy * UI_SRC_W + xx] = color;
+        for (int xx = x; xx < x + w; xx++) c->px[yy * c->w + xx] = color;
     }
 }
 
-static void put_text(uint16_t *px, int x, int y, const char *text, uint16_t color)
+static void put_text(canvas_t *c, int x, int y, const char *text, uint16_t color)
 {
     for (; *text; text++, x += 6 * UI_FONT_SCALE) {
         uint8_t rows[7];
@@ -157,7 +205,7 @@ static void put_text(uint16_t *px, int x, int y, const char *text, uint16_t colo
         for (int gy = 0; gy < 7; gy++) {
             for (int gx = 0; gx < 5; gx++) {
                 if (rows[gy] & (1 << (4 - gx))) {
-                    put_rect(px, x + gx * UI_FONT_SCALE, y + gy * UI_FONT_SCALE,
+                    put_rect(c, x + gx * UI_FONT_SCALE, y + gy * UI_FONT_SCALE,
                              UI_FONT_SCALE, UI_FONT_SCALE, color);
                 }
             }
@@ -166,10 +214,10 @@ static void put_text(uint16_t *px, int x, int y, const char *text, uint16_t colo
 }
 
 /* Draw text horizontally centred in [x0, x1). */
-static void put_text_centered(uint16_t *px, int x0, int x1, int y, const char *text, uint16_t color)
+static void put_text_centered(canvas_t *c, int x0, int x1, int y, const char *text, uint16_t color)
 {
     int tw = ((int)strlen(text) * 6 - 1) * UI_FONT_SCALE;
-    put_text(px, x0 + (x1 - x0 - tw) / 2, y, text, color);
+    put_text(c, x0 + (x1 - x0 - tw) / 2, y, text, color);
 }
 
 static int button_x(int i)
@@ -201,18 +249,20 @@ static void format_value(int g, char *text, size_t size)
 
 /* REC: red while recording, with the elapsed time underneath; NOSD / ERR when
  * the last start found no card or the last recording hit a write error. */
-static void render_rec(uint16_t *px)
+static void render_rec(canvas_t *c)
 {
     int x0 = button_x(UI_BTN_REC);
     uint16_t bg = s_pressed == UI_BTN_REC ? COLOR_PRESSED
                 : s_rec.state == RECORDER_RECORDING ? COLOR_REC_ON
                 : s_rec.state == RECORDER_IDLE ? COLOR_REC_IDLE : COLOR_REC_FAIL;
-    put_rect(px, x0 + 1, 1, UI_SRC_W - x0 - 2, UI_SRC_H - 2, bg);
-    put_text_centered(px, x0, UI_SRC_W, UI_LABEL_Y, s_labels[UI_BTN_REC], COLOR_LABEL);
+    put_rect(c, x0 + 1, 1, UI_SRC_W - x0 - 2, UI_SRC_H - 2, bg);
+    put_text_centered(c, x0, UI_SRC_W, UI_LABEL_Y, s_labels[UI_BTN_REC], COLOR_LABEL);
 
     char text[8] = "";
     if (s_rec.state == RECORDER_RECORDING) {
         snprintf(text, sizeof(text), "%" PRIu32 ":%02" PRIu32, s_rec.seconds / 60 % 100, s_rec.seconds % 60);
+    } else if (s_rec.state == RECORDER_IDLE) {
+        snprintf(text, sizeof(text), "%s", s_rec.source == RECORDER_SRC_UVC ? "UVC" : "IN");
     } else if (s_rec.state == RECORDER_NO_CARD) {
         snprintf(text, sizeof(text), "NOSD");
     } else if (s_rec.state == RECORDER_FULL) {
@@ -220,62 +270,138 @@ static void render_rec(uint16_t *px)
     } else if (s_rec.state == RECORDER_ERROR) {
         snprintf(text, sizeof(text), "ERR");
     }
-    put_text_centered(px, x0, UI_SRC_W, UI_VALUE_Y, text, COLOR_VALUE);
+    put_text_centered(c, x0, UI_SRC_W, UI_VALUE_Y, text, COLOR_VALUE);
 }
 
 /* WIFI: teal while on, with AP (access point only) or STA (also joined the
  * saved network) underneath; ... while starting, ERR when the C6 failed. */
-static void render_wifi(uint16_t *px)
+static void render_wifi(canvas_t *c)
 {
     int x0 = button_x(UI_BTN_WIFI), x1 = button_x(UI_BTN_WIFI + 1);
     uint16_t bg = s_pressed == UI_BTN_WIFI ? COLOR_PRESSED
                 : s_net.state == NET_ON ? COLOR_WIFI_ON
                 : s_net.state == NET_FAILED ? COLOR_REC_FAIL : COLOR_WIFI_OFF;
-    put_rect(px, x0 + 1, 1, x1 - x0 - 2, UI_SRC_H - 2, bg);
-    put_text_centered(px, x0, x1, UI_LABEL_Y, s_labels[UI_BTN_WIFI], COLOR_LABEL);
+    put_rect(c, x0 + 1, 1, x1 - x0 - 2, UI_SRC_H - 2, bg);
+    put_text_centered(c, x0, x1, UI_LABEL_Y, s_labels[UI_BTN_WIFI], COLOR_LABEL);
     const char *text = s_net.state == NET_STARTING ? "..."
                      : s_net.state == NET_FAILED ? "ERR"
                      : s_net.state == NET_OFF ? "OFF"
                      : s_net.sta_connected ? "STA" : "AP";
-    put_text_centered(px, x0, x1, UI_VALUE_Y, text, COLOR_VALUE);
+    put_text_centered(c, x0, x1, UI_VALUE_Y, text, COLOR_VALUE);
 }
 
 /* Target switch, then each group drawn as one stepper ("-" and "+" labels on
  * top, the current value centred across both buttons underneath), then reset
  * and record. */
-static void render_bar(uint16_t *px)
+static void render_bar(canvas_t *c)
 {
-    put_rect(px, 0, 0, UI_SRC_W, UI_SRC_H, COLOR_BAR);
+    put_rect(c, 0, 0, UI_SRC_W, UI_SRC_H, COLOR_BAR);
 
     int tx1 = button_x(UI_BTN_TARGET + 1);
     uint16_t tbg = s_pressed == UI_BTN_TARGET ? COLOR_PRESSED
                  : s_target == TARGET_UVC ? COLOR_TARGET_UV : COLOR_TARGET_IN;
-    put_rect(px, 1, 1, tx1 - 2, UI_SRC_H - 2, tbg);
-    put_text_centered(px, 0, tx1, UI_CENTER_Y, s_target == TARGET_UVC ? "UVC" : "IN", COLOR_LABEL);
+    put_rect(c, 1, 1, tx1 - 2, UI_SRC_H - 2, tbg);
+    put_text_centered(c, 0, tx1, UI_CENTER_Y, s_target == TARGET_UVC ? "UVC" : "IN", COLOR_LABEL);
 
     for (int g = 0; g < UI_GROUPS; g++) {
         int bm = 1 + 2 * g, bp = bm + 1;
         int x0 = button_x(bm), xm = button_x(bp), x1 = button_x(bp + 1);
         uint16_t bg = (g & 1) ? COLOR_GROUP_B : COLOR_GROUP_A;
-        put_rect(px, x0 + 1, 1, x1 - x0 - 2, UI_SRC_H - 2, bg);
-        if (s_pressed == bm) put_rect(px, x0 + 1, 1, xm - x0 - 1, UI_SRC_H - 2, COLOR_PRESSED);
-        if (s_pressed == bp) put_rect(px, xm, 1, x1 - xm - 1, UI_SRC_H - 2, COLOR_PRESSED);
-        put_rect(px, xm, 3, 1, UI_VALUE_Y - 5, COLOR_DIVIDER);
-        put_text_centered(px, x0, xm, UI_LABEL_Y, s_labels[bm], COLOR_LABEL);
-        put_text_centered(px, xm, x1, UI_LABEL_Y, s_labels[bp], COLOR_LABEL);
+        put_rect(c, x0 + 1, 1, x1 - x0 - 2, UI_SRC_H - 2, bg);
+        if (s_pressed == bm) put_rect(c, x0 + 1, 1, xm - x0 - 1, UI_SRC_H - 2, COLOR_PRESSED);
+        if (s_pressed == bp) put_rect(c, xm, 1, x1 - xm - 1, UI_SRC_H - 2, COLOR_PRESSED);
+        put_rect(c, xm, 3, 1, UI_VALUE_Y - 5, COLOR_DIVIDER);
+        put_text_centered(c, x0, xm, UI_LABEL_Y, s_labels[bm], COLOR_LABEL);
+        put_text_centered(c, xm, x1, UI_LABEL_Y, s_labels[bp], COLOR_LABEL);
 
         char text[8];
         format_value(g, text, sizeof(text));
-        put_text_centered(px, x0, x1, UI_VALUE_Y, text, COLOR_VALUE);
+        put_text_centered(c, x0, x1, UI_VALUE_Y, text, COLOR_VALUE);
     }
 
     int x0 = button_x(UI_BTN_RESET), x1 = button_x(UI_BTN_RESET + 1);
-    put_rect(px, x0 + 1, 1, x1 - x0 - 2, UI_SRC_H - 2,
+    put_rect(c, x0 + 1, 1, x1 - x0 - 2, UI_SRC_H - 2,
              s_pressed == UI_BTN_RESET ? COLOR_RESET_ON : COLOR_RESET);
-    put_text_centered(px, x0, x1, UI_CENTER_Y, s_labels[UI_BTN_RESET], COLOR_LABEL);
+    put_text_centered(c, x0, x1, UI_CENTER_Y, s_labels[UI_BTN_RESET], COLOR_LABEL);
 
-    render_wifi(px);
-    render_rec(px);
+    render_wifi(c);
+    render_rec(c);
+}
+
+/* ---- tabs and pages ------------------------------------------------------------ */
+
+static void render_tabs(canvas_t *c)
+{
+    put_rect(c, 0, 0, c->w, c->h, COLOR_TAB_BG);
+    for (int i = 0; i < CAMERA_UI_PAGE_COUNT; i++) {
+        int x0 = i * c->w / CAMERA_UI_PAGE_COUNT, x1 = (i + 1) * c->w / CAMERA_UI_PAGE_COUNT;
+        if (i == (int)s_page) {
+            put_rect(c, x0 + 1, 1, x1 - x0 - 2, c->h - 2, COLOR_TAB_ON);
+        }
+        put_text_centered(c, x0, x1, (c->h - 7 * UI_FONT_SCALE) / 2, s_tab_labels[i],
+                          i == (int)s_page ? COLOR_LABEL : COLOR_DIM);
+    }
+}
+
+/* One selectable option: a box with a title and a detail line. */
+static void render_option(canvas_t *c, int x, const char *title, const char *detail, bool on, bool enabled)
+{
+    put_rect(c, x, SET_BTN_Y, SET_BTN_W, SET_BTN_H, on ? COLOR_LABEL : COLOR_DIVIDER);
+    put_rect(c, x + 3, SET_BTN_Y + 3, SET_BTN_W - 6, SET_BTN_H - 6, on ? COLOR_OPT_ON : COLOR_OPT);
+    uint16_t fg = enabled ? COLOR_LABEL : COLOR_DIM;
+    put_text_centered(c, x, x + SET_BTN_W, SET_BTN_Y + 18, title, fg);
+    put_text_centered(c, x, x + SET_BTN_W, SET_BTN_Y + 50, detail, on ? COLOR_VALUE : fg);
+}
+
+static void render_settings(canvas_t *c)
+{
+    put_rect(c, 0, 0, c->w, c->h, COLOR_PAGE_BG);
+    put_text(c, 20, 24, "RECORD CAMERA", COLOR_LABEL);
+    const bool uvc_rec = s_rec.source == RECORDER_SRC_UVC;
+    const bool locked = s_rec.state == RECORDER_RECORDING;
+    char uvc_detail[24];
+    if (s_uvc_seen.streaming) {
+        snprintf(uvc_detail, sizeof(uvc_detail), "%uX%u", s_uvc_seen.w, s_uvc_seen.h);
+    } else {
+        snprintf(uvc_detail, sizeof(uvc_detail), "NOT CONNECTED");
+    }
+    char in_detail[24];
+    snprintf(in_detail, sizeof(in_detail), "%dX%d", APP_CAM_BUILTIN_W, APP_CAM_BUILTIN_H);
+    render_option(c, SET_BTN_IN_X, "BUILT-IN", in_detail, !uvc_rec, !locked);
+    render_option(c, SET_BTN_UVC_X, "UVC", uvc_detail, uvc_rec, !locked && s_uvc_seen.streaming);
+    if (locked) {
+        put_text(c, 20, SET_BTN_Y + SET_BTN_H + 20, "STOP RECORDING TO CHANGE", COLOR_VALUE);
+    }
+}
+
+static void render_measure(canvas_t *c)
+{
+    put_rect(c, 0, 0, c->w, c->h, COLOR_PAGE_BG);
+    put_text_centered(c, 0, c->w, c->h / 2 - 24, "MEASURE", COLOR_LABEL);
+    put_text_centered(c, 0, c->w, c->h / 2 + 4, "NO MODULE CONNECTED", COLOR_DIM);
+}
+
+/* Render the tabs and (off the camera page) the page into the back images. */
+static void publish_page(void)
+{
+    int tb = s_tab_front ^ 1, pb = s_page_front ^ 1;
+    canvas_t tabs = { s_tab_buf[tb], UI_SRC_W, UI_TAB_SRC_H };
+    render_tabs(&tabs);
+    canvas_t page = { s_page_buf[pb], UI_SRC_W, UI_PAGE_SRC_H };
+    if (s_page == CAMERA_UI_PAGE_SETTINGS) {
+        render_settings(&page);
+    } else if (s_page == CAMERA_UI_PAGE_MEASURE) {
+        render_measure(&page);
+    }
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    s_tab_front = tb;
+    s_tab_frame.data = (uint8_t *)s_tab_buf[tb];
+    if (s_page != CAMERA_UI_PAGE_CAMERA) {
+        s_page_front = pb;
+        s_page_frame.data = (uint8_t *)s_page_buf[pb];
+    }
+    xSemaphoreGive(s_lock);
+    display_comp_request_redraw();
 }
 
 /* Render into the back image, swap it in and ask the display for a redraw. */
@@ -283,7 +409,8 @@ static void publish_bar(void)
 {
     int back = s_front ^ 1;
     int64_t t0 = esp_timer_get_time();
-    render_bar(s_buf[back]);
+    canvas_t bar = { s_buf[back], UI_SRC_W, UI_SRC_H };
+    render_bar(&bar);
     uint32_t us = (uint32_t)(esp_timer_get_time() - t0);
     if (us > s_render_us_max) {
         s_render_us_max = us;
@@ -486,6 +613,26 @@ static void ui_task(void *arg)
                 publish_bar();
                 continue;
             }
+            if (button >= UI_EVT_TAB && button < UI_EVT_TAB + CAMERA_UI_PAGE_COUNT) {
+                s_page = (camera_ui_page_t)(button - UI_EVT_TAB);
+                recorder_get_stats(&s_rec);
+                cam_uvc_get_stats(&s_uvc_seen);
+                ESP_LOGI(TAG, "page -> %s", s_tab_labels[s_page]);
+                publish_page();
+                publish_bar();
+                continue;
+            }
+            if (button == UI_EVT_SRC_IN || button == UI_EVT_SRC_UVC) {
+                recorder_source_t src = button == UI_EVT_SRC_UVC ? RECORDER_SRC_UVC : RECORDER_SRC_BUILTIN;
+                esp_err_t err = (src == RECORDER_SRC_UVC && !s_uvc_seen.streaming) ? ESP_ERR_INVALID_STATE
+                                : recorder_set_source(src);
+                ESP_LOGI(TAG, "record source -> %s: %s", src == RECORDER_SRC_UVC ? "UVC" : "built-in",
+                         esp_err_to_name(err));
+                recorder_get_stats(&s_rec);
+                publish_page();
+                publish_bar();
+                continue;
+            }
             apply_button(button);
             s_pressed = button;
             highlight_end = xTaskGetTickCount() + pdMS_TO_TICKS(APP_UI_HIGHLIGHT_MS);
@@ -509,6 +656,17 @@ static void ui_task(void *arg)
             redraw = true;
         }
         s_net = net;
+        bool page_redraw = false;
+        if (s_page == CAMERA_UI_PAGE_SETTINGS) {
+            cam_uvc_stats_t uvc;
+            cam_uvc_get_stats(&uvc);
+            page_redraw = redraw || uvc.streaming != s_uvc_seen.streaming || uvc.w != s_uvc_seen.w ||
+                          uvc.h != s_uvc_seen.h;
+            s_uvc_seen = uvc;
+        }
+        if (page_redraw) {
+            publish_page();
+        }
         if (redraw) {
             publish_bar();
         }
@@ -528,15 +686,27 @@ esp_err_t camera_ui_init(void)
                                             MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
         ESP_RETURN_ON_FALSE(s_buf[i], ESP_ERR_NO_MEM, TAG, "no overlay memory");
     }
+    for (int i = 0; i < 2; i++) {
+        s_tab_buf[i] = heap_caps_aligned_calloc(64, UI_SRC_W * UI_TAB_SRC_H, sizeof(uint16_t), MALLOC_CAP_SPIRAM);
+        s_page_buf[i] = heap_caps_aligned_calloc(64, UI_SRC_W * UI_PAGE_SRC_H, sizeof(uint16_t), MALLOC_CAP_SPIRAM);
+        ESP_RETURN_ON_FALSE(s_tab_buf[i] && s_page_buf[i], ESP_ERR_NO_MEM, TAG, "no page memory");
+    }
     s_lock = xSemaphoreCreateMutex();
-    s_queue = xQueueCreate(4, sizeof(int));
+    s_queue = xQueueCreate(8, sizeof(int));
     ESP_RETURN_ON_FALSE(s_lock && s_queue, ESP_ERR_NO_MEM, TAG, "no memory");
 
     recorder_get_stats(&s_rec);
     net_wifi_get_status(&s_net);
-    render_bar(s_buf[0]);
+    canvas_t bar = { s_buf[0], UI_SRC_W, UI_SRC_H };
+    render_bar(&bar);
     s_front = 0;
     s_frame = (video_frame_t){ .data = (uint8_t *)s_buf[0], .w = UI_SRC_W, .h = UI_SRC_H, .stride = UI_SRC_W };
+    canvas_t tabs = { s_tab_buf[0], UI_SRC_W, UI_TAB_SRC_H };
+    render_tabs(&tabs);
+    s_tab_front = 0;
+    s_tab_frame = (video_frame_t){ .data = (uint8_t *)s_tab_buf[0], .w = UI_SRC_W, .h = UI_TAB_SRC_H, .stride = UI_SRC_W };
+    s_page_front = 0;
+    s_page_frame = (video_frame_t){ .data = (uint8_t *)s_page_buf[0], .w = UI_SRC_W, .h = UI_PAGE_SRC_H, .stride = UI_SRC_W };
     ESP_RETURN_ON_FALSE(xTaskCreate(ui_task, "camera_ui", APP_TASK_UI_STACK, NULL,
                                     APP_TASK_UI_PRIO, NULL) == pdPASS,
                         ESP_ERR_NO_MEM, TAG, "task create failed");
@@ -548,21 +718,46 @@ esp_err_t camera_ui_init(void)
 
 void camera_ui_on_touch(uint16_t x, uint16_t y)
 {
-    if (!s_queue || y < CAMERA_UI_Y || y >= CAMERA_UI_Y + CAMERA_UI_HEIGHT || x >= 1280) return;
-    int button = (int)x * UI_BUTTONS / 1280;
-    if (xQueueSend(s_queue, &button, 0) != pdTRUE) {
-        ESP_LOGW(TAG, "busy, tap %d dropped", button);
+    if (!s_queue || x >= 1280 || y >= 720) return;
+    int item = -1;
+    if (y < CAMERA_UI_TAB_HEIGHT) {
+        item = UI_EVT_TAB + (int)x * CAMERA_UI_PAGE_COUNT / 1280;
+    } else if (s_page == CAMERA_UI_PAGE_CAMERA) {
+        if (y >= CAMERA_UI_Y && y < CAMERA_UI_Y + CAMERA_UI_HEIGHT) {
+            item = (int)x * UI_BUTTONS / 1280;
+        }
+    } else if (s_page == CAMERA_UI_PAGE_SETTINGS) {
+        int sx = x / 2, sy = (y - CAMERA_UI_TAB_HEIGHT) / 2;
+        if (sy >= SET_BTN_Y && sy < SET_BTN_Y + SET_BTN_H) {
+            if (sx >= SET_BTN_IN_X && sx < SET_BTN_IN_X + SET_BTN_W) {
+                item = UI_EVT_SRC_IN;
+            } else if (sx >= SET_BTN_UVC_X && sx < SET_BTN_UVC_X + SET_BTN_W) {
+                item = UI_EVT_SRC_UVC;
+            }
+        }
+    }
+    if (item >= 0 && xQueueSend(s_queue, &item, 0) != pdTRUE) {
+        ESP_LOGW(TAG, "busy, tap %d dropped", item);
     }
 }
 
-const video_frame_t *camera_ui_acquire_frame(void)
+camera_ui_page_t camera_ui_page(void)
 {
-    if (!s_lock) return NULL;
-    xSemaphoreTake(s_lock, portMAX_DELAY);
-    return &s_frame;
+    return s_page;
 }
 
-void camera_ui_release_frame(void)
+bool camera_ui_acquire(camera_ui_frames_t *out)
+{
+    if (!s_lock) return false;
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    const bool camera = s_page == CAMERA_UI_PAGE_CAMERA;
+    out->tabs = &s_tab_frame;
+    out->bar = camera ? &s_frame : NULL;
+    out->page = camera ? NULL : &s_page_frame;
+    return true;
+}
+
+void camera_ui_release(void)
 {
     xSemaphoreGive(s_lock);
 }

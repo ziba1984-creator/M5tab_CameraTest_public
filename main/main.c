@@ -200,12 +200,14 @@ static void log_stats(void)
     cam_uvc_get_stats(&rx);
 
     float secs = APP_TASK_STATS_PERIOD_MS / 1000.0f;
-    ESP_LOGI(TAG, "builtin %.1f fps | uvc %s %ux%u rx %.1f fps dec %.1f fps (err %u, nobuf %u, drop %u) | "
-                  "display %.1f fps | PSRAM %uK int %uK",
+    ESP_LOGI(TAG, "builtin %.1f fps | uvc %s %ux%u rx %.1f fps dec %.1f fps (err %u [last bad len %u], "
+                  "skip %u, underflow %u, nobuf %u, drop %u) | display %.1f fps | PSRAM %uK int %uK",
              (builtin.published - prev_builtin.published) / secs,
              rx.streaming ? "ON" : "off", rx.w, rx.h,
              (rx.rx_frames - prev_rx.rx_frames) / secs, (uvc.published - prev_uvc.published) / secs,
-             (unsigned)(rx.decode_errors - prev_rx.decode_errors), (unsigned)(rx.no_buffer - prev_rx.no_buffer),
+             (unsigned)(rx.decode_errors - prev_rx.decode_errors), (unsigned)rx.bad_len_last,
+             (unsigned)(rx.skipped - prev_rx.skipped), (unsigned)(rx.underflow - prev_rx.underflow),
+             (unsigned)(rx.no_buffer - prev_rx.no_buffer),
              (unsigned)(rx.rx_dropped - prev_rx.rx_dropped),
              (disp.flips - prev_disp.flips) / secs,
              (unsigned)(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024),
@@ -216,12 +218,14 @@ static void log_stats(void)
     uint32_t flips = disp.flips - prev_disp.flips;
     uint32_t dec_n = rx.decoded - prev_rx.decoded;
     ESP_LOGI(TAG, "prof: srm %u us x%u | fill %u us x%u | flip call %u us, wait %u us (per flip) | "
-                  "jpeg %u us, %u B/frame",
+                  "jpeg dec %u us, enc %u us x%u, %u B/frame",
              srm_n ? (unsigned)((disp.srm_us - prev_disp.srm_us) / srm_n) : 0, (unsigned)srm_n,
              fill_n ? (unsigned)((disp.fill_us - prev_disp.fill_us) / fill_n) : 0, (unsigned)fill_n,
              flips ? (unsigned)((disp.flip_call_us - prev_disp.flip_call_us) / flips) : 0,
              flips ? (unsigned)((disp.flip_wait_us - prev_disp.flip_wait_us) / flips) : 0,
              dec_n ? (unsigned)((rx.decode_us - prev_rx.decode_us) / dec_n) : 0,
+             (rx.encoded - prev_rx.encoded) ? (unsigned)((rx.encode_us - prev_rx.encode_us) / (rx.encoded - prev_rx.encoded)) : 0,
+             (unsigned)(rx.encoded - prev_rx.encoded),
              (rx.rx_frames - prev_rx.rx_frames)
                  ? (unsigned)((rx.rx_bytes - prev_rx.rx_bytes) / (rx.rx_frames - prev_rx.rx_frames)) : 0);
     prev_builtin = builtin;
@@ -335,6 +339,17 @@ void app_main(void)
     }
 #endif
     ESP_LOGI(TAG, "running");
+#if APP_REC_AUTOTEST
+    vTaskDelay(pdMS_TO_TICKS(8000));
+    ESP_LOGW(TAG, "rec autotest: source UVC (%s), start: %s", esp_err_to_name(recorder_set_source(RECORDER_SRC_UVC)),
+             esp_err_to_name(recorder_start()));
+    for (int i = 0; i < 4; i++) {
+        vTaskDelay(pdMS_TO_TICKS(APP_TASK_STATS_PERIOD_MS));
+        log_stats();
+    }
+    recorder_stop();
+    ESP_LOGW(TAG, "rec autotest: stopped");
+#endif
 
     for (;;) {
         vTaskDelay(pdMS_TO_TICKS(APP_TASK_STATS_PERIOD_MS));

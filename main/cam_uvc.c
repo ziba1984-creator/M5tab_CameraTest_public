@@ -1,6 +1,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "esp_check.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
@@ -14,6 +15,8 @@
 #include "cam_uvc.h"
 #include "cam_uvc_ctrl.h"
 #include "jpeg_dec.h"
+#include "driver/jpeg_encode.h"
+#include "recorder.h"
 
 static const char *TAG = "cam_uvc";
 
@@ -32,6 +35,7 @@ typedef struct {
 typedef struct {
     const uvc_host_frame_t *frame;
     uint32_t gen;               /* stream generation the frame belongs to */
+    bool show;                  /* convert for the display (YUY2 frames may be recorded only) */
 } rx_item_t;
 
 static QueueHandle_t s_evt_q;           /* driver/stream callbacks -> manager task */
@@ -49,6 +53,18 @@ static cam_uvc_stats_t s_stats;
  * every access goes through this short critical section (64-bit fields included). */
 static portMUX_TYPE s_stats_mux = portMUX_INITIALIZER_UNLOCKED;
 #define STATS(stmt) do { taskENTER_CRITICAL(&s_stats_mux); stmt; taskEXIT_CRITICAL(&s_stats_mux); } while (0)
+/* Format of the open stream: set by try_open() before the stream starts. */
+static volatile int s_format;           /* UVC_VS_FORMAT_MJPEG or UVC_VS_FORMAT_YUY2 */
+static uint16_t s_yuy2_w, s_yuy2_h;
+static uint32_t s_skip_count;           /* frame callback only */
+
+/* YUY2: the hardware JPEG encoder turns each frame into JPEG, which is both
+ * recorded (recorder_push_jpeg) and decoded for the display like an MJPEG frame.
+ * Its input must be 16-byte aligned PSRAM, so YUY2 streams use our own frame buffers. */
+static jpeg_encoder_handle_t s_enc;     /* NULL: no encoder, convert on the CPU */
+static uint8_t *s_jpg;                  /* encoder output */
+static size_t s_jpg_cap;
+static uint8_t *s_fb[APP_UVC_FRAME_BUFS]; /* frame buffers of the open YUY2 stream */
 static volatile TickType_t s_last_rx;   /* tick of the last received frame (stall watchdog) */
 static int s_open_failures;             /* consecutive failed opens of a present camera */
 
@@ -77,6 +93,9 @@ static void on_stream_event(const uvc_host_stream_event_data_t *event, void *ctx
     case UVC_HOST_TRANSFER_ERROR:
         ESP_LOGW(TAG, "USB transfer error %d", event->transfer_error.error);
         break;
+    case UVC_HOST_FRAME_BUFFER_UNDERFLOW:
+        STATS(s_stats.underflow++);     /* every frame buffer was in use: the driver dropped a frame */
+        break;
     case UVC_HOST_FRAME_BUFFER_OVERFLOW:
         ESP_LOGW(TAG, "frame buffer overflow (frame bigger than frame_size)");
         break;
@@ -89,7 +108,17 @@ static bool on_frame(const uvc_host_frame_t *frame, void *ctx)
 {
     STATS(s_stats.rx_frames++; s_stats.rx_bytes += frame->data_len);
     s_last_rx = xTaskGetTickCount();
-    rx_item_t item = { .frame = frame, .gen = s_gen };
+    bool show = true;
+    const bool rec = s_enc && recorder_wants_uvc();
+    if (s_format == UVC_VS_FORMAT_YUY2) {
+        const uint32_t every = rec ? APP_UVC_YUY2_EVERY_REC : APP_UVC_YUY2_EVERY;
+        show = every <= 1 || (s_skip_count++ % every) == 0;
+    }
+    if (!show && !rec) {
+        STATS(s_stats.skipped++);
+        return true;        /* neither shown nor recorded: straight back to the driver */
+    }
+    rx_item_t item = { .frame = frame, .gen = s_gen, .show = show };
     if (xQueueSendToBack(s_rx_q, &item, 0) != pdPASS) {
         STATS(s_stats.rx_dropped++);
         return true;        /* not queued: hand the buffer straight back to the driver */
@@ -122,7 +151,49 @@ static uint8_t sample_luma(const uint8_t *buf, int w, int h, int stride)
 }
 #endif
 
-static void decode_and_publish(const uvc_host_frame_t *f)
+static inline uint8_t clamp8(int v)
+{
+    return v < 0 ? 0 : v > 255 ? 255 : (uint8_t)v;
+}
+
+static inline uint16_t rgb565(int y, int ru, int guv, int bu)
+{
+    y = (y - 16) * 298;
+    return (uint16_t)((clamp8((y + ru + 128) >> 8) >> 3) << 11 |
+                      (clamp8((y - guv + 128) >> 8) >> 2) << 5 |
+                      (clamp8((y + bu + 128) >> 8) >> 3));
+}
+
+/* YUY2 (Y0 U Y1 V, BT.601 limited range) -> RGB565, rows of `stride` pixels. */
+static esp_err_t yuy2_convert(const uint8_t *src, size_t len, uint8_t *out, size_t out_cap,
+                              jpeg_dec_result_t *r)
+{
+    const int w = s_yuy2_w, h = s_yuy2_h, stride = (w + 15) & ~15;
+    if (len != (size_t)w * h * 2) {
+        STATS(s_stats.bad_len_last = len);
+        return ESP_ERR_INVALID_SIZE;    /* incomplete frame: packets were lost */
+    }
+    if ((size_t)stride * h * 2 > out_cap) {
+        return ESP_ERR_NO_MEM;
+    }
+    for (int row = 0; row < h; row++) {
+        const uint8_t *s = src + (size_t)row * w * 2;
+        uint16_t *d = (uint16_t *)out + (size_t)row * stride;
+        for (int x = 0; x < w; x += 2, s += 4) {
+            int u = s[1] - 128, v = s[3] - 128;
+            int ru = 409 * v, guv = 100 * u + 208 * v, bu = 516 * u;
+            d[x] = rgb565(s[0], ru, guv, bu);
+            d[x + 1] = rgb565(s[2], ru, guv, bu);
+        }
+    }
+    r->w = w;
+    r->h = h;
+    r->stride = stride;
+    return ESP_OK;
+}
+
+/* Convert `data` (JPEG, or raw YUY2 when there is no encoder) for the display. */
+static void decode_and_publish(const uint8_t *data, size_t len, bool raw_yuy2)
 {
     int idx;
     if (xQueueReceive(s_out_free_q, &idx, 0) != pdTRUE) {
@@ -131,14 +202,16 @@ static void decode_and_publish(const uvc_host_frame_t *f)
     }
     jpeg_dec_result_t r;
     int64_t t0 = esp_timer_get_time();
-    esp_err_t err = jpeg_dec_decode(f->data, f->data_len, s_out[idx], s_out_cap, &r);
+    esp_err_t err = raw_yuy2 ? yuy2_convert(data, len, s_out[idx], s_out_cap, &r)
+                             : jpeg_dec_decode(data, len, s_out[idx], s_out_cap, &r);
     uint32_t dec_us = (uint32_t)(esp_timer_get_time() - t0);
     STATS(s_stats.decode_us += dec_us);
     if (err != ESP_OK) {
         uint32_t errors;
         STATS(errors = s_stats.decode_errors++);
         if ((errors % 30) == 0) {
-            ESP_LOGW(TAG, "JPEG decode failed (%s), %u bytes", esp_err_to_name(err), (unsigned)f->data_len);
+            ESP_LOGW(TAG, "%s failed (%s), %u bytes", raw_yuy2 ? "YUY2 frame" : "JPEG decode",
+                     esp_err_to_name(err), (unsigned)len);
         }
         xQueueSend(s_out_free_q, &idx, 0);
         return;
@@ -158,6 +231,51 @@ static void decode_and_publish(const uvc_host_frame_t *f)
     frame_mbox_publish(s_mbox, &out);
 }
 
+/* YUY2 frame: hardware JPEG once, then record it and/or show it. */
+static void process_yuy2(const uvc_host_frame_t *f, bool show)
+{
+    const size_t want = (size_t)s_yuy2_w * s_yuy2_h * 2;
+    if (f->data_len != want) {
+        uint32_t errors;
+        STATS(errors = s_stats.decode_errors++; s_stats.bad_len_last = f->data_len);
+        if ((errors % 30) == 0) {
+            ESP_LOGW(TAG, "YUY2 frame of %u bytes, expected %u (packets lost)", (unsigned)f->data_len, (unsigned)want);
+        }
+        return;
+    }
+    if (!s_enc) {
+        if (show) {
+            decode_and_publish(f->data, f->data_len, true);
+        }
+        return;
+    }
+    const jpeg_encode_cfg_t cfg = {
+        .width = s_yuy2_w,
+        .height = s_yuy2_h,
+        .src_type = JPEG_ENCODE_IN_FORMAT_YUV422,
+        .sub_sample = JPEG_DOWN_SAMPLING_YUV422,
+        .image_quality = APP_REC_QUALITY,
+        .pixel_reverse = true,      /* P4 rev1.0 encoder reads YUY2 (Y0 U Y1 V) only this way round */
+    };
+    uint32_t jlen = 0;
+    int64_t t0 = esp_timer_get_time();
+    esp_err_t err = jpeg_encoder_process(s_enc, &cfg, f->data, f->data_len, s_jpg, s_jpg_cap, &jlen);
+    uint32_t enc_us = (uint32_t)(esp_timer_get_time() - t0);
+    STATS(s_stats.encode_us += enc_us; s_stats.encoded++);
+    if (err != ESP_OK) {
+        uint32_t errors;
+        STATS(errors = s_stats.decode_errors++);
+        if ((errors % 30) == 0) {
+            ESP_LOGW(TAG, "YUY2 JPEG encode failed (%s)", esp_err_to_name(err));
+        }
+        return;
+    }
+    recorder_push_jpeg(s_jpg, jlen, t0);    /* ignored unless recording this camera */
+    if (show) {
+        decode_and_publish(s_jpg, jlen, false);
+    }
+}
+
 static void decode_task(void *arg)
 {
     for (;;) {
@@ -173,7 +291,11 @@ static void decode_task(void *arg)
         xSemaphoreTake(s_lock, portMAX_DELAY);
         if (xQueueReceive(s_rx_q, &item, 0) == pdTRUE) {
             if (s_stream && item.gen == s_gen) {
-                decode_and_publish(item.frame);
+                if (s_format == UVC_VS_FORMAT_YUY2) {
+                    process_yuy2(item.frame, item.show);
+                } else {
+                    decode_and_publish(item.frame->data, item.frame->data_len, false);
+                }
                 uvc_host_frame_return(s_stream, (uvc_host_frame_t *)item.frame);
             } else {
                 /* Cannot happen while close_stream() drains under s_lock; keep it loud. */
@@ -253,16 +375,17 @@ static void log_modes(const uvc_host_frame_info_t *list, size_t n)
     }
 }
 
-/* Choose the MJPEG mode closest to the wanted size, then the nearest frame rate. */
-static bool choose_mode(const uvc_host_frame_info_t *list, size_t n, uvc_host_stream_format_t *out)
+/* Choose the mode of `format` closest to the wanted size, then the nearest frame rate. */
+static bool choose_format_mode(const uvc_host_frame_info_t *list, size_t n, enum uvc_host_stream_format format,
+                               int want_w, int want_h, int want_fps, uvc_host_stream_format_t *out)
 {
     long best_score = -1;
     const uvc_host_frame_info_t *best = NULL;
-    const long want_area = (long)APP_UVC_W * APP_UVC_H;
+    const long want_area = (long)want_w * want_h;
 
     for (size_t i = 0; i < n; i++) {
         const uvc_host_frame_info_t *fi = &list[i];
-        if (fi->format != UVC_VS_FORMAT_MJPEG || fi->h_res > APP_UVC_MAX_W || fi->v_res > APP_UVC_MAX_H) {
+        if (fi->format != format || fi->h_res > APP_UVC_MAX_W || fi->v_res > APP_UVC_MAX_H) {
             continue;
         }
         long area = (long)fi->h_res * fi->v_res;
@@ -275,15 +398,80 @@ static bool choose_mode(const uvc_host_frame_info_t *list, size_t n, uvc_host_st
     if (!best) {
         return false;
     }
-    uint32_t interval = pick_interval(best, INTERVAL_100NS(APP_UVC_FPS));
-    out->format = UVC_VS_FORMAT_MJPEG;
+    uint32_t interval = pick_interval(best, INTERVAL_100NS(want_fps));
+    out->format = format;
     out->h_res = best->h_res;
     out->v_res = best->v_res;
     out->fps = interval ? 1e7f / interval : 0;
     return true;
 }
 
+/* MJPEG when the camera has it; otherwise uncompressed YUY2. */
+static bool choose_mode(const uvc_host_frame_info_t *list, size_t n, uvc_host_stream_format_t *out)
+{
+    return choose_format_mode(list, n, UVC_VS_FORMAT_MJPEG, APP_UVC_W, APP_UVC_H, APP_UVC_FPS, out) ||
+           choose_format_mode(list, n, UVC_VS_FORMAT_YUY2, APP_UVC_YUY2_W, APP_UVC_YUY2_H, APP_UVC_YUY2_FPS, out);
+}
+
 static void close_stream(void);
+
+static void free_frame_buffers(void)
+{
+    for (int i = 0; i < APP_UVC_FRAME_BUFS; i++) {
+        heap_caps_free(s_fb[i]);
+        s_fb[i] = NULL;
+    }
+}
+
+#if APP_UVC_DESC_DUMP
+#include "usb/usb_helpers.h"
+/* Defined (non-static) in usb_host_uvc's uvc_descriptor_printing.c, but not in a public header. */
+void uvc_print_desc(const usb_standard_desc_t *desc);
+
+static void dump_client_event(const usb_host_client_event_msg_t *msg, void *arg)
+{
+}
+
+/* Diagnostic: bus speed and every descriptor of the device, once per boot. */
+static void dump_descriptors(uint8_t addr)
+{
+    static bool done;
+    if (done) {
+        return;
+    }
+    done = true;
+    const usb_host_client_config_t cfg = {
+        .is_synchronous = false,
+        .max_num_event_msg = 4,
+        .async = { .client_event_callback = dump_client_event, .callback_arg = NULL },
+    };
+    usb_host_client_handle_t client;
+    if (usb_host_client_register(&cfg, &client) != ESP_OK) {
+        ESP_LOGW(TAG, "descriptor dump: client register failed");
+        return;
+    }
+    usb_device_handle_t dev;
+    if (usb_host_device_open(client, addr, &dev) == ESP_OK) {
+        usb_device_info_t info;
+        if (usb_host_device_info(dev, &info) == ESP_OK) {
+            static const char *const speeds[] = { "Low", "Full", "High" };
+            ESP_LOGW(TAG, "==== descriptor dump: address %u, %s Speed ====", addr,
+                     info.speed < 3 ? speeds[info.speed] : "?");
+        }
+        const usb_device_desc_t *dd;
+        const usb_config_desc_t *cd;
+        if (usb_host_get_device_descriptor(dev, &dd) == ESP_OK) {
+            usb_print_device_descriptor(dd);
+        }
+        if (usb_host_get_active_config_descriptor(dev, &cd) == ESP_OK) {
+            usb_print_config_descriptor(cd, &uvc_print_desc);
+        }
+        ESP_LOGW(TAG, "==== descriptor dump end ====");
+        usb_host_device_close(client, dev);
+    }
+    usb_host_client_deregister(client);
+}
+#endif
 
 static esp_err_t try_open(uint8_t addr, uint8_t idx)
 {
@@ -291,6 +479,9 @@ static esp_err_t try_open(uint8_t addr, uint8_t idx)
     if (uvc_host_get_frame_list(addr, idx, NULL, &n) != ESP_OK || n == 0) {
         return ESP_ERR_NOT_FOUND;      /* not a UVC device */
     }
+#if APP_UVC_DESC_DUMP
+    dump_descriptors(addr);
+#endif
     uvc_host_frame_info_t *list = calloc(n, sizeof(*list));
     ESP_RETURN_ON_FALSE(list, ESP_ERR_NO_MEM, TAG, "no memory");
     esp_err_t ret = uvc_host_get_frame_list(addr, idx, (uvc_host_frame_info_t (*)[])list, &n);
@@ -306,11 +497,32 @@ static esp_err_t try_open(uint8_t addr, uint8_t idx)
     bool found = choose_mode(list, n, &fmt);
     free(list);
     if (!found) {
-        ESP_LOGE(TAG, "camera has no usable MJPEG mode (<= %dx%d)", APP_UVC_MAX_W, APP_UVC_MAX_H);
+        ESP_LOGE(TAG, "camera has no usable MJPEG or YUY2 mode (<= %dx%d)", APP_UVC_MAX_W, APP_UVC_MAX_H);
         return ESP_ERR_NOT_SUPPORTED;
     }
-    ESP_LOGI(TAG, "selected MJPEG %ux%u @ %.1f fps (wanted %dx%d @ %d)", fmt.h_res, fmt.v_res, fmt.fps,
-             APP_UVC_W, APP_UVC_H, APP_UVC_FPS);
+    const bool yuy2 = fmt.format == UVC_VS_FORMAT_YUY2;
+    ESP_LOGI(TAG, "selected %s %ux%u @ %.1f fps (wanted %dx%d @ %d)", yuy2 ? "YUY2" : "MJPEG",
+             fmt.h_res, fmt.v_res, fmt.fps, yuy2 ? APP_UVC_YUY2_W : APP_UVC_W,
+             yuy2 ? APP_UVC_YUY2_H : APP_UVC_H, yuy2 ? APP_UVC_YUY2_FPS : APP_UVC_FPS);
+    /* No stream is running here, so the frame callback and decode task cannot see a half update. */
+    s_format = fmt.format;
+    s_yuy2_w = fmt.h_res;
+    s_yuy2_h = fmt.v_res;
+    s_skip_count = 0;
+
+    /* YUY2 with the encoder: frame buffers the JPEG encoder can read directly. */
+    size_t fb_size = 0;
+    if (yuy2 && s_enc) {
+        fb_size = ((size_t)fmt.h_res * fmt.v_res * 2 + 63) & ~(size_t)63;
+        for (int i = 0; i < APP_UVC_FRAME_BUFS; i++) {
+            s_fb[i] = heap_caps_aligned_alloc(64, fb_size, MALLOC_CAP_SPIRAM);
+            if (!s_fb[i]) {
+                free_frame_buffers();
+                ESP_LOGE(TAG, "no memory for %u-byte frame buffers", (unsigned)fb_size);
+                return ESP_ERR_NO_MEM;
+            }
+        }
+    }
 
     const uvc_host_stream_config_t cfg = {
         .event_cb = on_stream_event,
@@ -325,14 +537,20 @@ static esp_err_t try_open(uint8_t addr, uint8_t idx)
         .vs_format = fmt,
         .advanced = {
             .number_of_frame_buffers = APP_UVC_FRAME_BUFS,
-            .frame_size = 0,                        /* use the size negotiated with the camera */
+            .frame_size = fb_size,                  /* 0: use the size negotiated with the camera */
             .frame_heap_caps = MALLOC_CAP_SPIRAM,
-            .number_of_urbs = 3,
-            .urb_size = 16 * 1024,
+            .number_of_urbs = APP_UVC_URBS,
+            .urb_size = APP_UVC_URB_KB * 1024,
+            .user_frame_buffers = fb_size ? s_fb : NULL,
         },
     };
     uvc_host_stream_hdl_t hdl = NULL;
-    ESP_RETURN_ON_ERROR(uvc_host_stream_open(&cfg, pdMS_TO_TICKS(2000), &hdl), TAG, "stream open failed");
+    esp_err_t open_err = uvc_host_stream_open(&cfg, pdMS_TO_TICKS(2000), &hdl);
+    if (open_err != ESP_OK) {
+        free_frame_buffers();
+        ESP_LOGE(TAG, "stream open failed (%s)", esp_err_to_name(open_err));
+        return open_err;
+    }
 
     uvc_host_stream_format_t actual = { 0 };
     if (uvc_host_stream_format_get(hdl, &actual) == ESP_OK) {
@@ -411,7 +629,11 @@ static void close_stream(void)
     if (hdl) {
         esp_err_t err = uvc_host_stream_close(hdl);
         if (err != ESP_OK) {
+            /* The driver may still use our frame buffers: leak them rather than free them. */
             ESP_LOGE(TAG, "stream close failed (%s)", esp_err_to_name(err));
+            memset(s_fb, 0, sizeof(s_fb));
+        } else {
+            free_frame_buffers();
         }
     }
 }
@@ -531,6 +753,19 @@ esp_err_t cam_uvc_init(void)
 
     ESP_RETURN_ON_ERROR(cam_uvc_ctrl_init(), TAG, "control init failed");
     ESP_RETURN_ON_ERROR(jpeg_dec_init(), TAG, "JPEG decoder init failed");
+    /* Optional: without it YUY2 cameras are converted on the CPU (slow, no recording). */
+    const jpeg_encode_engine_cfg_t enc_cfg = { .intr_priority = 0, .timeout_ms = 100 };
+    const jpeg_encode_memory_alloc_cfg_t jpg_cfg = { .buffer_direction = JPEG_ENC_ALLOC_OUTPUT_BUFFER };
+    if (jpeg_new_encoder_engine(&enc_cfg, &s_enc) == ESP_OK &&
+        (s_jpg = jpeg_alloc_encoder_mem(APP_REC_VIDEO_SLOT_KB * 1024, &jpg_cfg, &s_jpg_cap)) != NULL) {
+        ESP_LOGI(TAG, "YUY2 cameras: hardware JPEG (%u KB output)", (unsigned)(s_jpg_cap / 1024));
+    } else {
+        ESP_LOGW(TAG, "no JPEG encoder: YUY2 cameras are converted on the CPU and cannot be recorded");
+        if (s_enc) {
+            jpeg_del_encoder_engine(s_enc);
+            s_enc = NULL;
+        }
+    }
     size_t want = jpeg_dec_output_size(APP_UVC_MAX_W, APP_UVC_MAX_H);
     for (int i = 0; i < APP_UVC_OUT_BUFS; i++) {
         s_out[i] = jpeg_dec_alloc_output(want, &s_out_cap);

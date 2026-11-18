@@ -18,7 +18,12 @@ typedef struct {
     uint32_t decode_us;     /* accumulated JPEG decode time */
     uint32_t rx_dropped;    /* dropped because the decoder was behind */
     uint32_t decoded;
-    uint32_t decode_errors;
+    uint32_t decode_errors; /* JPEG decode failures, or YUY2 frames of the wrong length */
+    uint32_t skipped;       /* YUY2 frames left out on purpose (APP_UVC_YUY2_EVERY) */
+    uint32_t bad_len_last;  /* length of the last wrong-length YUY2 frame */
+    uint32_t underflow;     /* frames the driver dropped: no free frame buffer */
+    uint32_t encoded;       /* YUY2 frames JPEG-encoded (for the display and/or the recorder) */
+    uint32_t encode_us;     /* accumulated JPEG encode time */
     uint32_t no_buffer;     /* no free output buffer (display is behind) */
     uint32_t stall_restarts; /* stalls detected by the watchdog */
     uint32_t power_cycles;  /* USB-A power cycles (stall, wedged camera or requested) */

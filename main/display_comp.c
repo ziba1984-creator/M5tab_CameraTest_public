@@ -25,7 +25,8 @@ static const char *TAG = "display_comp";
 #define CANVAS_W    (APP_LCD_PHYS_H)
 #define CANVAS_H    (APP_LCD_PHYS_W)
 #define PANE_W      (CANVAS_W / DISP_PANE_COUNT)
-#define PANE_H      (CAMERA_UI_Y)
+#define PANE_Y      (CAMERA_UI_TAB_HEIGHT)      /* panes sit between the tabs and the bar */
+#define PANE_H      (CAMERA_UI_Y - PANE_Y)
 #define FB_BYTES    (APP_LCD_PHYS_W * APP_LCD_PHYS_H * 2)
 
 #define PPA_SCALE_FRAC  16      /* PPA scale resolution: 1/16 */
@@ -109,7 +110,7 @@ static void fit_image(const video_frame_t *f, int src_rot, int pane, int *scale1
     logical->w = dw;
     logical->h = dh;
     logical->x = (pane * PANE_W + (PANE_W - dw) / 2) & ~1;
-    logical->y = ((PANE_H - dh) / 2) & ~1;
+    logical->y = PANE_Y + (((PANE_H - dh) / 2) & ~1);
 }
 
 /* ---- PPA helpers ---------------------------------------------------------- */
@@ -188,7 +189,7 @@ static void draw_pane(int fb_i, int p)
     pane_t *pn = &s_panes[p];
     uint8_t *fb = s_fb[fb_i];
     drawn_t *d = &s_drawn[fb_i][p];
-    rect_t pane_phys = logical_to_phys((rect_t){ p * PANE_W, 0, PANE_W, PANE_H });
+    rect_t pane_phys = logical_to_phys((rect_t){ p * PANE_W, PANE_Y, PANE_W, PANE_H });
 
     if (!pn->has_cur) {
         if (d->state != DRAWN_NO_SIGNAL) {
@@ -226,6 +227,7 @@ static void display_task(void *arg)
 {
     int back = 1;
     bool dirty = true;      /* draw the initial "no signal" panes */
+    camera_ui_page_t shown = CAMERA_UI_PAGE_CAMERA;
 
     for (;;) {
         EventBits_t bits = xEventGroupWaitBits(s_evt, EVT_PANE_BITS | EVT_REDRAW_BIT, pdTRUE, pdFALSE,
@@ -233,6 +235,19 @@ static void display_task(void *arg)
         int64_t now = esp_timer_get_time();
         if (bits & EVT_REDRAW_BIT) {
             dirty = true;
+        }
+        /* Off the camera page the panes are not drawn: frames are handed back at
+         * once (cameras and the recorder keep running) and only UI changes redraw. */
+        const camera_ui_page_t page = camera_ui_page();
+        const bool camera_page = page == CAMERA_UI_PAGE_CAMERA;
+        if (page != shown) {
+            shown = page;
+            dirty = true;
+            for (int i = 0; i < 2; i++) {
+                for (int p = 0; p < DISP_PANE_COUNT; p++) {
+                    s_drawn[i][p].state = DRAWN_UNKNOWN;     /* the page image covered them */
+                }
+            }
         }
 
         for (int p = 0; p < DISP_PANE_COUNT; p++) {
@@ -248,7 +263,7 @@ static void display_task(void *arg)
                 pn->cur = f;
                 pn->has_cur = true;
                 pn->last_us = now;
-                dirty = true;
+                dirty |= camera_page;
             } else if (pn->has_cur && (now - pn->last_us) > APP_PANE_STALE_MS * 1000LL) {
                 frame_mbox_release(pn->mbox, &pn->cur);
                 pn->has_cur = false;
@@ -260,15 +275,25 @@ static void display_task(void *arg)
         }
         dirty = false;
 
-        for (int p = 0; p < DISP_PANE_COUNT; p++) {
-            draw_pane(back, p);
+        if (camera_page) {
+            for (int p = 0; p < DISP_PANE_COUNT; p++) {
+                draw_pane(back, p);
+            }
         }
-        const video_frame_t *ui = camera_ui_acquire_frame();
-        if (ui) {
-            rect_t ui_logical = { 0, CAMERA_UI_Y, CANVAS_W, CAMERA_UI_HEIGHT };
-            draw_image(s_fb[back], ui, APP_DISPLAY_ROT_DEG, 2 * PPA_SCALE_FRAC,
-                       logical_to_phys(ui_logical));
-            camera_ui_release_frame();
+        camera_ui_frames_t ui;
+        if (camera_ui_acquire(&ui)) {
+            const struct { const video_frame_t *img; rect_t at; } parts[] = {
+                { ui.tabs, { 0, 0, CANVAS_W, CAMERA_UI_TAB_HEIGHT } },
+                { ui.bar,  { 0, CAMERA_UI_Y, CANVAS_W, CAMERA_UI_HEIGHT } },
+                { ui.page, { 0, CAMERA_UI_TAB_HEIGHT, CANVAS_W, CANVAS_H - CAMERA_UI_TAB_HEIGHT } },
+            };
+            for (size_t i = 0; i < sizeof(parts) / sizeof(parts[0]); i++) {
+                if (parts[i].img) {
+                    draw_image(s_fb[back], parts[i].img, APP_DISPLAY_ROT_DEG, 2 * PPA_SCALE_FRAC,
+                               logical_to_phys(parts[i].at));
+                }
+            }
+            camera_ui_release();
         }
 
         /* Flip, then wait until the old buffer has left the scan-out. */

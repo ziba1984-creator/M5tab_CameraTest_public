@@ -44,7 +44,18 @@
 #define APP_UVC_FPS             30
 #define APP_UVC_MAX_W           1280    /* decode buffers are sized for this */
 #define APP_UVC_MAX_H           720
-#define APP_UVC_FRAME_BUFS      3       /* MJPEG frame buffers inside the UVC driver */
+/* Cameras without MJPEG: an uncompressed YUY2 mode is used instead. Each frame is
+ * JPEG-encoded in hardware (quality APP_REC_QUALITY); the JPEG is recorded when this
+ * camera is the recording source, and every APP_UVC_YUY2_EVERY-th one is decoded
+ * for the display (1 = all). Without the encoder the CPU converts instead (slow). */
+#define APP_UVC_YUY2_W          640
+#define APP_UVC_YUY2_H          480
+#define APP_UVC_YUY2_FPS        30
+#define APP_UVC_YUY2_EVERY      2
+#define APP_UVC_YUY2_EVERY_REC  4       /* while recording this camera: its display competes for PSRAM with the USB */
+#define APP_UVC_FRAME_BUFS      3       /* frame buffers inside the UVC driver */
+#define APP_UVC_URBS            4       /* USB transfers in flight (internal RAM) */
+#define APP_UVC_URB_KB          24      /* each; 24 KB = 8 microframes of 3 KB isochronous payload */
 #define APP_UVC_OUT_BUFS        3       /* decoded RGB565 buffers */
 #define APP_UVC_ROT_DEG         0       /* extra rotation of the image (0/90/180/270, CCW) */
 #define APP_UVC_RGB_ORDER       JPEG_DEC_RGB_ELEMENT_ORDER_BGR  /* switch to ..._RGB if red/blue look swapped */
@@ -57,6 +68,7 @@
 #define APP_UVC_APPLY_DELAY_MS  1500    /* quiet time after the last tap before a settings restart */
 #define APP_UVC_STALL_TEST      0       /* temporary: stop the stream once after 20 s to test recovery */
 #define APP_UVC_CTRL_TEST       0       /* temporary: sweep UVC controls and measure the effect */
+#define APP_UVC_DESC_DUMP       0       /* temporary: print speed + full descriptors of a new camera once per boot */
 
 /* ---- Recording (built-in camera + microphone -> AVI on microSD) ------------
  * REC on the control bar records MJPEG video (hardware JPEG) and 16-bit PCM
@@ -72,6 +84,7 @@
 #define APP_REC_AUDIO_CHUNK_MS  100     /* one AVI audio chunk */
 #define APP_REC_AUDIO_SLOTS     24      /* audio chunks waiting for the card (2.4 s) */
 #define APP_REC_AUDIO_SKIP_MS   200     /* drop the codec's start-up click */
+#define APP_REC_AUTOTEST        0       /* temporary: record the UVC camera for 20 s, 8 s after start-up */
 #define APP_REC_WRITE_BUF_KB    32      /* stdio buffer: the card is fastest with 32 KB internal-RAM writes */
 
 #define APP_TASK_REC_AUDIO_PRIO     7   /* read-only loop: the I2S DMA ring holds only ~0.1 s */

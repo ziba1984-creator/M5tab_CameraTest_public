@@ -1,12 +1,19 @@
 #pragma once
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 #include "esp_err.h"
 #include "freertos/FreeRTOS.h"
 
-/* Records the built-in camera (hardware JPEG, MJPEG) and the microphone
- * (16-bit PCM) into AVI files on the microSD card (APP_REC_* in app_config.h). */
+/* Records one camera (MJPEG) and the microphone (16-bit PCM) into AVI files on
+ * the microSD card (APP_REC_* in app_config.h). The built-in camera is encoded
+ * here; the UVC camera hands over JPEG frames it encoded itself (recorder_push_jpeg). */
+
+typedef enum {
+    RECORDER_SRC_BUILTIN,
+    RECORDER_SRC_UVC,
+} recorder_source_t;
 
 typedef enum {
     RECORDER_IDLE,
@@ -27,14 +34,23 @@ typedef struct {
     uint64_t bytes;             /* size of the current or last file */
     uint32_t encode_us_max;
     uint32_t write_ms_max;      /* longest single chunk write */
+    recorder_source_t source;   /* camera being (or to be) recorded */
 } recorder_stats_t;
 
 /* Mounts the card (never formats it), sets up the encoder, buffers and tasks.
  * Failing to mount is not an error: start retries it. */
 esp_err_t recorder_init(void);
 
-/* Called from the UI task only. */
+/* Called from the UI task only. Start fails with ESP_ERR_INVALID_STATE when the
+ * UVC camera is the source and is not streaming. */
 esp_err_t recorder_start(void);
+/* Which camera the next recording uses. Refused (ESP_ERR_INVALID_STATE) while recording. */
+esp_err_t recorder_set_source(recorder_source_t source);
+recorder_source_t recorder_get_source(void);
+/* True while recording the UVC camera: it should then pass every frame to recorder_push_jpeg(). */
+bool recorder_wants_uvc(void);
+/* UVC camera: one JPEG frame (copied; any task). Dropped when not recording it. */
+void recorder_push_jpeg(const uint8_t *jpeg, size_t len, int64_t t_us);
 void recorder_stop(void);
 
 void recorder_get_stats(recorder_stats_t *out);

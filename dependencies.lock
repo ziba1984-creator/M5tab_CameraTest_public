@@ -386,14 +386,12 @@ dependencies:
       type: service
     version: 0.1.5
   espressif/usb:
-    component_hash: 99eee72ea224d9117d4c342442717a1f20bf8112e2ab5d7d7038b827874f4c92
     dependencies:
     - name: idf
-      require: private
       version: '>=5.5.3'
     source:
-      registry_url: https://components.espressif.com
-      type: service
+      path: override/espressif__usb
+      type: local
     targets:
     - esp32s2
     - esp32s3
@@ -403,21 +401,18 @@ dependencies:
     - linux
     version: 1.6.0
   espressif/usb_host_uvc:
-    component_hash: f20c4e4dea50536e2e29daaf589b5f5984402284c155867daef27d6b64869f78
     dependencies:
     - name: idf
-      require: private
       version: '>=5.0'
     - name: espressif/usb
-      registry_url: https://components.espressif.com
-      require: public
+      public: true
       rules:
       - if: idf_version >=6.0
       - if: target not in ["linux"]
       version: ^1.0.0
     source:
-      registry_url: https://components.espressif.com/
-      type: service
+      path: override/espressif__usb_host_uvc
+      type: local
     targets:
     - esp32s2
     - esp32s3
@@ -480,7 +475,9 @@ direct_dependencies:
 - espressif/esp_wifi_remote
 - espressif/m5stack_tab5
 - espressif/mdns
+- espressif/usb
+- espressif/usb_host_uvc
 - idf
-manifest_hash: db8a676c0a102f714682198d63c6fa1080c75c6bdc45a331cd3c923bffb60060
+manifest_hash: e9e9e0c10bef2bff5c8a91fce64126eba01599449c92b5e1085f995b60ad0032
 target: esp32p4
 version: 2.0.0

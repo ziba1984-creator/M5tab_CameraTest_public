@@ -25,6 +25,9 @@ CONFIG_BSP_LCD_DPI_BUFFER_NUMS=2
 
 # USB host: UVC cameras have large configuration descriptors (default 256 is too small)
 CONFIG_USB_HOST_CONTROL_TRANSFER_MAX_SIZE=4096
+# The YUY2 camera (VID 1908 / PID 2311) never sets the EOH bit in its payload
+# headers; with this check on, the UVC driver silently drops every packet.
+# CONFIG_UVC_CHECK_PAYLOAD_HEADER_EOH is not set
 
 # Wi-Fi: ESP32-C6 on SDIO slot 1 through esp_hosted (see docs/HARDWARE_NOTES.md 7).
 # The Tab5 preset's active-low C6 reset never releases the C6 on this unit.
