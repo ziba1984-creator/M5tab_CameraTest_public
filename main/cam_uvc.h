@@ -42,6 +42,9 @@ esp_err_t cam_uvc_start(void);
 
 void cam_uvc_get_stats(cam_uvc_stats_t *out);
 
+/* True when the current UVC mode can provide JPEG frames to the recorder. */
+bool cam_uvc_recording_supported(void);
+
 /* Power-cycle the camera from the manager task, APP_UVC_APPLY_DELAY_MS after the
  * last request. It drops off the bus, re-enumerates and is probed and opened
  * again (about 2-3 s without video). */

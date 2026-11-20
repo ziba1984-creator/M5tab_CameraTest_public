@@ -412,6 +412,11 @@ esp_err_t recorder_start(void)
             ESP_LOGW(TAG, "UVC camera not streaming: nothing to record");
             return ESP_ERR_INVALID_STATE;
         }
+        if (!cam_uvc_recording_supported()) {
+            ESP_LOGW(TAG, "UVC camera mode cannot be recorded without the JPEG encoder");
+            STATS(s_stats.state = RECORDER_ERROR);
+            return ESP_ERR_NOT_SUPPORTED;
+        }
         s_rec_w = uvc.w;
         s_rec_h = uvc.h;
     } else {

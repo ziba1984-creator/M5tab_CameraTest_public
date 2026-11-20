@@ -294,6 +294,7 @@ static void decode_task(void *arg)
                 if (s_format == UVC_VS_FORMAT_YUY2) {
                     process_yuy2(item.frame, item.show);
                 } else {
+                    recorder_push_jpeg(item.frame->data, item.frame->data_len, esp_timer_get_time());
                     decode_and_publish(item.frame->data, item.frame->data_len, false);
                 }
                 uvc_host_frame_return(s_stream, (uvc_host_frame_t *)item.frame);
@@ -804,4 +805,9 @@ esp_err_t cam_uvc_start(void)
 void cam_uvc_get_stats(cam_uvc_stats_t *out)
 {
     STATS(*out = s_stats);
+}
+
+bool cam_uvc_recording_supported(void)
+{
+    return s_format != UVC_VS_FORMAT_YUY2 || s_enc != NULL;
 }

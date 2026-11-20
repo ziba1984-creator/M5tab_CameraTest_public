@@ -19,7 +19,7 @@ typedef enum {
     RECORDER_IDLE,
     RECORDER_RECORDING,
     RECORDER_NO_CARD,       /* last start found no usable card */
-    RECORDER_ERROR,         /* last recording stopped on a write error */
+    RECORDER_ERROR,         /* last recording failed to start or stopped on a write error */
     RECORDER_FULL,          /* file numbers used up (R9999.AVI exists) */
 } recorder_state_t;
 
