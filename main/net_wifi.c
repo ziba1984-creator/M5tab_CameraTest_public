@@ -41,6 +41,7 @@ static net_status_t s_st;
 /* Wi-Fi task only */
 static bool s_c6_ok;                    /* the C6 answered over SDIO */
 static bool s_stack_ok;                 /* netif, event loop, Wi-Fi driver, mDNS set up */
+static bool s_web_down;                 /* Wi-Fi on but the web server failed to start (net task only) */
 static esp_netif_t *s_sta_netif, *s_ap_netif;
 
 static atomic_bool s_running;           /* between esp_wifi_start and esp_wifi_stop */
@@ -122,9 +123,23 @@ esp_err_t net_wifi_save_settings(const char *ap_pass, const char *sta_ssid, cons
         if (err == ESP_OK) err = nvs_set_str(h, "sta_ssid", next.sta_ssid);
         if (err == ESP_OK) err = nvs_set_str(h, "sta_pass", next.sta_pass);
         if (err == ESP_OK) err = nvs_commit(h);
+        if (err != ESP_OK) {
+            /* nvs_set_str() writes at once: put back what may have been stored,
+             * so the next boot does not use an AP password nobody was told about. */
+            nvs_set_str(h, "ap_pass", s_set.ap_pass);
+            nvs_set_str(h, "sta_ssid", s_set.sta_ssid);
+            nvs_set_str(h, "sta_pass", s_set.sta_pass);
+            nvs_commit(h);
+        }
         nvs_close(h);
     }
     if (err == ESP_OK) {
+        if (strcmp(next.sta_ssid, s_set.sta_ssid) != 0) {
+            /* Until Wi-Fi restarts, do not show the old network's link as the new one's. */
+            s_st.sta_connected = false;
+            s_st.sta_ip = 0;
+            s_st.sta_rssi = 0;
+        }
         s_set = next;
         s_st.sta_configured = next.sta_ssid[0] != '\0';
         strlcpy(s_st.sta_ssid, next.sta_ssid, sizeof(s_st.sta_ssid));
@@ -330,8 +345,9 @@ static void turn_on(void)
         set_state(NET_FAILED);
         return;
     }
-    if (web_server_start() != ESP_OK) {
-        ESP_LOGE(TAG, "web server did not start");
+    s_web_down = web_server_start(WEB_USER_WIFI) != ESP_OK;
+    if (s_web_down) {
+        ESP_LOGE(TAG, "web server did not start; retrying");
     }
     set_state(NET_ON);
 }
@@ -339,13 +355,16 @@ static void turn_on(void)
 static void turn_off(void)
 {
     if (atomic_load(&s_running)) {
-        if (web_server_stop() != ESP_OK) {
+        if (web_server_stop(WEB_USER_WIFI) != ESP_OK) {
             /* A download still owns the web server: keep Wi-Fi and the server
-             * consistent (both on) and let the user switch off again. */
+             * consistent (both on, and accepting downloads again, as the
+             * screen shows ON) and let the user switch off again. */
             ESP_LOGE(TAG, "Wi-Fi stays on: the web server could not be stopped");
+            web_server_start(WEB_USER_WIFI);
             set_state(NET_ON);
             return;
         }
+        s_web_down = false;
         stop_wifi();
         ESP_LOGI(TAG, "Wi-Fi off");
     }
@@ -377,7 +396,7 @@ static void net_task(void *arg)
                 if (start_wifi() != ESP_OK) {
                     /* If a download still holds it, the server stays; the next
                      * start reuses it (web_server_start accepts it again). */
-                    if (web_server_stop() != ESP_OK) {
+                    if (web_server_stop(WEB_USER_WIFI) != ESP_OK) {
                         ESP_LOGW(TAG, "web server left running while Wi-Fi is down");
                     }
                     set_state(NET_FAILED);
@@ -387,6 +406,12 @@ static void net_task(void *arg)
             }
         }
         int64_t at = atomic_load(&s_retry_at);
+        if (s_web_down && atomic_load(&s_running)) {
+            s_web_down = web_server_start(WEB_USER_WIFI) != ESP_OK;
+            if (!s_web_down) {
+                ESP_LOGI(TAG, "web server started");
+            }
+        }
         if (at && atomic_load(&s_running) && esp_timer_get_time() >= at) {
             /* Pushed back first so a missing event cannot stop the retries. */
             atomic_store(&s_retry_at, esp_timer_get_time() + APP_WIFI_STA_RETRY_MS * 1000LL);

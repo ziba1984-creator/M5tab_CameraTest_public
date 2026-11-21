@@ -68,6 +68,7 @@
 #define APP_UVC_APPLY_DELAY_MS  1500    /* quiet time after the last tap before a settings restart */
 #define APP_UVC_STALL_TEST      0       /* temporary: stop the stream once after 20 s to test recovery */
 #define APP_UVC_CTRL_TEST       0       /* temporary: sweep UVC controls and measure the effect */
+#define APP_STACK_PROBE         0       /* temporary: M5-Bus 5 V on, I2C scan, read the Stack modules */
 #define APP_UVC_DESC_DUMP       0       /* temporary: print speed + full descriptors of a new camera once per boot */
 
 /* ---- Recording (built-in camera + microphone -> AVI on microSD) ------------
@@ -86,6 +87,8 @@
 #define APP_REC_AUDIO_SKIP_MS   200     /* drop the codec's start-up click */
 #define APP_REC_AUTOTEST        0       /* temporary: record the UVC camera for 20 s, 8 s after start-up */
 #define APP_REC_WRITE_BUF_KB    32      /* stdio buffer: the card is fastest with 32 KB internal-RAM writes */
+#define APP_REC_MIN_FREE_MB     16      /* stop (FULL) below this, leaving room for the index */
+#define APP_REC_FREE_CHECK_S    5       /* how often the free space is checked while recording */
 
 #define APP_TASK_REC_AUDIO_PRIO     7   /* read-only loop: the I2S DMA ring holds only ~0.1 s */
 #define APP_TASK_REC_AUDIO_STACK    4096
@@ -114,6 +117,16 @@
 #define APP_WIFI_APPLY_DELAY_MS 1000    /* let the settings page get its reply before Wi-Fi restarts */
 #define APP_TASK_NET_PRIO       3
 #define APP_TASK_NET_STACK      4096
+
+/* ---- Stack modules on the M5-Bus (MEASURE page) ------------------------------ */
+#define APP_MODULE_POLL_MS      1000    /* look for I2C modules and read them this often */
+#define APP_TASK_MODULES_PRIO   2
+#define APP_TASK_MODULES_STACK  3072
+
+/* ---- Wired LAN (LAN Module 13.2, W5500 on the M5-Bus SPI) -------------------- */
+#define APP_ETH_SPI_MHZ         20      /* W5500 SPI clock */
+#define APP_ETH_POLL_MS         2       /* receive polling (the INT jumper is not used) */
+#define APP_ETH_APPLY_DELAY_MS  1000    /* let the settings page get its reply before the address changes */
 
 #define APP_WEB_PRIO            2       /* below the camera and recorder tasks */
 #define APP_WEB_STACK           6144

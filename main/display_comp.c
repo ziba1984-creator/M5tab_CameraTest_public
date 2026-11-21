@@ -191,7 +191,7 @@ static void draw_pane(int fb_i, int p)
     drawn_t *d = &s_drawn[fb_i][p];
     rect_t pane_phys = logical_to_phys((rect_t){ p * PANE_W, PANE_Y, PANE_W, PANE_H });
 
-    if (!pn->has_cur) {
+    if (!pn->has_cur || pn->cur.w == 0 || pn->cur.h == 0) {
         if (d->state != DRAWN_NO_SIGNAL) {
             d->state = fill_rect(fb, pane_phys, pn->no_signal) == ESP_OK ? DRAWN_NO_SIGNAL : DRAWN_UNKNOWN;
         }
@@ -204,7 +204,11 @@ static void draw_pane(int fb_i, int p)
     rect_t img_phys = logical_to_phys(logical);
 
     if (d->state != DRAWN_LIVE || !rect_eq(d->rect, img_phys)) {
-        fill_rect(fb, pane_phys, 0);    /* clear letterbox / previous content */
+        /* clear letterbox / previous content */
+        if (fill_rect(fb, pane_phys, 0) != ESP_OK) {
+            d->state = DRAWN_UNKNOWN;
+            return;
+        }
     }
     esp_err_t err = draw_image(fb, &pn->cur, APP_DISPLAY_ROT_DEG + pn->rot_deg, scale16, img_phys);
     if (err != ESP_OK) {
@@ -296,10 +300,13 @@ static void display_task(void *arg)
             camera_ui_release();
         }
 
-        /* Flip, then wait until the old buffer has left the scan-out. */
-        xSemaphoreTake(s_flip_sem, 0);
+        /* Flip, then wait until the old buffer has left the scan-out.
+         * draw_bitmap writes back the cache before it switches the scan-out
+         * index, so a frame that completes during that call still restarted on
+         * the old buffer. Clear the semaphore only after the switch. */
         int64_t t_flip = esp_timer_get_time();
         esp_err_t err = esp_lcd_panel_draw_bitmap(s_panel, 0, 0, APP_LCD_PHYS_W, APP_LCD_PHYS_H, s_fb[back]);
+        xSemaphoreTake(s_flip_sem, 0);
         int64_t t_wait = esp_timer_get_time();
         s_stats.flip_call_us += (uint32_t)(t_wait - t_flip);
         if (err != ESP_OK) {

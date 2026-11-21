@@ -72,6 +72,7 @@ typedef struct {
     uint32_t pu_controls;
     uint32_t ct_controls;
     uint16_t bcd_uvc;
+    uint16_t vid, pid;
 } vc_layout_t;
 
 /* s_lock guards everything below and is held for every control transfer, so
@@ -89,6 +90,7 @@ static cam_uvc_ctrl_notify_fn s_notify;
 static int32_t s_desired[CAM_UVC_CTRL_COUNT];
 static bool s_has_desired[CAM_UVC_CTRL_COUNT];
 static bool s_needs_restart[CAM_UVC_CTRL_COUNT];
+static uint16_t s_desired_vid, s_desired_pid;   /* camera the values above belong to */
 
 static uint32_t bitmap(const uint8_t *p, uint8_t size)
 {
@@ -167,6 +169,11 @@ static esp_err_t read_layout(uint8_t dev_addr, vc_layout_t *out)
         if (ret == ESP_OK) {
             parse_config(config_desc, out);
         }
+        const usb_device_desc_t *dev_desc = NULL;
+        if (usb_host_get_device_descriptor(dev, &dev_desc) == ESP_OK) {
+            out->vid = dev_desc->idVendor;
+            out->pid = dev_desc->idProduct;
+        }
         usb_host_device_close(client, dev);
     }
     usb_host_client_deregister(client);
@@ -174,11 +181,13 @@ static esp_err_t read_layout(uint8_t dev_addr, vc_layout_t *out)
 }
 
 /* One PU request (caller holds s_lock). The ELP camera sporadically STALLs or
- * errors a valid request (a different control on every connect), so retry. */
+ * errors a valid request (a different control on every connect), so retry.
+ * A timeout is not retried: each attempt can block for seconds while the
+ * caller (UI or stream close) holds s_lock. */
 static esp_err_t pu_xfer(uint8_t type, uint8_t request, const pu_desc_t *pu, uint8_t len, uint8_t *buf)
 {
     esp_err_t err = ESP_FAIL;
-    for (int attempt = 0; attempt < PU_ATTEMPTS && err != ESP_OK; attempt++) {
+    for (int attempt = 0; attempt < PU_ATTEMPTS && err != ESP_OK && err != ESP_ERR_TIMEOUT; attempt++) {
         if (attempt) {
             vTaskDelay(pdMS_TO_TICKS(PU_RETRY_DELAY_MS));
         }
@@ -258,6 +267,9 @@ static void apply_desired_locked(void)
                 continue;
             }
             int32_t value = s_desired[i];
+            if (value < info->minimum || value > info->maximum) {
+                continue;   /* not valid for this camera */
+            }
             esp_err_t err = pu_set(pu, value);
             int32_t actual = value;
             if (err == ESP_OK && pu_get(REQ_GET_CUR, pu, pu->len, &actual) == ESP_OK) {
@@ -277,6 +289,13 @@ static esp_err_t probe_locked(uint8_t dev_addr, uvc_host_stream_hdl_t stream)
              layout.bcd_uvc >> 8, layout.bcd_uvc & 0xff, layout.vc_intf, layout.ct_controls);
     ESP_RETURN_ON_FALSE(layout.found, ESP_ERR_NOT_FOUND, TAG, "no Processing Unit");
     ESP_LOGI(TAG, "Processing Unit id %u, controls 0x%06" PRIx32, layout.unit_id, layout.pu_controls);
+    if (layout.vid != s_desired_vid || layout.pid != s_desired_pid) {
+        /* Another camera: the previous one's settings and quirks do not apply. */
+        memset(s_has_desired, 0, sizeof(s_has_desired));
+        memset(s_needs_restart, 0, sizeof(s_needs_restart));
+        s_desired_vid = layout.vid;
+        s_desired_pid = layout.pid;
+    }
     s_layout = layout;
     s_stream = stream;
 
@@ -395,11 +414,15 @@ esp_err_t cam_uvc_ctrl_set(cam_uvc_ctrl_t control, int32_t value)
         err = ESP_ERR_INVALID_STATE;
     } else if (value < info->minimum || value > info->maximum) {
         err = ESP_ERR_INVALID_ARG;
+    } else if (auto_overrides(pu)) {
+        /* The camera ignores the manual value while its auto partner is on;
+         * a restart would not change that. */
+        err = ESP_ERR_INVALID_STATE;
     } else {
         s_desired[control] = value;
         s_has_desired[control] = true;
         err = ESP_FAIL;
-        if (!s_needs_restart[control] && !auto_overrides(pu)) {
+        if (!s_needs_restart[control]) {
             err = pu_set(pu, value);
             if (err != ESP_OK) {
                 s_needs_restart[control] = true;

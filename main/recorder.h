@@ -20,7 +20,7 @@ typedef enum {
     RECORDER_RECORDING,
     RECORDER_NO_CARD,       /* last start found no usable card */
     RECORDER_ERROR,         /* last recording failed to start or stopped on a write error */
-    RECORDER_FULL,          /* file numbers used up (R9999.AVI exists) */
+    RECORDER_FULL,          /* card almost full, or file numbers used up (R9999.AVI exists) */
 } recorder_state_t;
 
 typedef struct {
@@ -51,6 +51,12 @@ recorder_source_t recorder_get_source(void);
 bool recorder_wants_uvc(void);
 /* UVC camera: one JPEG frame (copied; any task). Dropped when not recording it. */
 void recorder_push_jpeg(const uint8_t *jpeg, size_t len, int64_t t_us);
+/* UVC camera: its stream (re)started with this frame size. A recording of the
+ * UVC camera with another size is stopped (state RECORDER_ERROR). Any task. */
+void recorder_uvc_size(uint16_t w, uint16_t h);
+/* Waits up to about 5 s for the file to be finished. If the card is slower
+ * than that, the state stays RECORDER_RECORDING until the writer is done, and
+ * recorder_start() refuses (ESP_ERR_INVALID_STATE) until then. */
 void recorder_stop(void);
 
 void recorder_get_stats(recorder_stats_t *out);

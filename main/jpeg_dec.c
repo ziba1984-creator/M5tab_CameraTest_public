@@ -51,15 +51,27 @@ static esp_err_t ensure_input_capacity(size_t len)
     return ESP_OK;
 }
 
+/* Failures are logged at debug level only: a lossy camera link can produce a
+ * broken frame every frame, and the caller already rate-limits its own report. */
 esp_err_t jpeg_dec_decode(const uint8_t *jpeg, size_t len, uint8_t *out, size_t out_cap,
                           jpeg_dec_result_t *result)
 {
     jpeg_decode_picture_info_t info;
-    ESP_RETURN_ON_ERROR(jpeg_decoder_get_info(jpeg, len, &info), TAG, "bad JPEG header");
+    esp_err_t err = jpeg_decoder_get_info(jpeg, len, &info);
+    if (err != ESP_OK) {
+        ESP_LOGD(TAG, "bad JPEG header (%s)", esp_err_to_name(err));
+        return err;
+    }
+    if (info.width == 0 || info.height == 0) {
+        ESP_LOGD(TAG, "JPEG header has no size");
+        return ESP_ERR_INVALID_SIZE;
+    }
 
     size_t need = jpeg_dec_output_size(info.width, info.height);
-    ESP_RETURN_ON_FALSE(need <= out_cap, ESP_ERR_NO_MEM, TAG, "%ux%u does not fit the output buffer",
-                        (unsigned)info.width, (unsigned)info.height);
+    if (need > out_cap) {
+        ESP_LOGD(TAG, "%ux%u does not fit the output buffer", (unsigned)info.width, (unsigned)info.height);
+        return ESP_ERR_NO_MEM;
+    }
     ESP_RETURN_ON_ERROR(ensure_input_capacity(len), TAG, "input buffer");
     memcpy(s_in_buf, jpeg, len);
 
@@ -69,8 +81,11 @@ esp_err_t jpeg_dec_decode(const uint8_t *jpeg, size_t len, uint8_t *out, size_t 
         .conv_std = JPEG_YUV_RGB_CONV_STD_BT601,
     };
     uint32_t out_size = 0;
-    ESP_RETURN_ON_ERROR(jpeg_decoder_process(s_engine, &cfg, s_in_buf, len, out, out_cap, &out_size),
-                        TAG, "decode failed");
+    err = jpeg_decoder_process(s_engine, &cfg, s_in_buf, len, out, out_cap, &out_size);
+    if (err != ESP_OK) {
+        ESP_LOGD(TAG, "decode failed (%s)", esp_err_to_name(err));
+        return err;
+    }
 
     result->w = info.width;
     result->h = info.height;

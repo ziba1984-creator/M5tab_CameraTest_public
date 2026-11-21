@@ -1,3 +1,4 @@
+#include <ctype.h>
 #include <dirent.h>
 #include <fcntl.h>
 #include <unistd.h>
@@ -6,6 +7,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/stat.h>
 #include "esp_heap_caps.h"
 #include "esp_http_server.h"
@@ -23,6 +25,7 @@
 #include "cam_builtin.h"
 #include "cam_uvc.h"
 #include "display_comp.h"
+#include "net_eth.h"
 #include "net_wifi.h"
 #include "recorder.h"
 #include "web_server.h"
@@ -30,6 +33,7 @@
 static const char *TAG = "web";
 
 #define SETTINGS_BODY_MAX   512
+#define ETH_BODY_MAX        160
 #define DELETE_BODY_MAX     4096    /* newline-separated Rnnnn.AVI names */
 #define TOKEN_LEN           32      /* hex characters of the per-boot request token */
 #define PAGE_TOKEN_MARK     "@@TOKEN@@"
@@ -85,9 +89,18 @@ static const char PAGE[] =
 "<label>接続先のパスワード（ネットワーク名が同じなら、空欄で変えない）</label>"
 "<input name=sta_pass type=password autocomplete=new-password>"
 "<button>保存</button><span id=msg></span></form>"
-"<small>保存すると Wi-Fi が一度切れます。つなぎ直してください。</small></section><script>"
+"<small>保存すると Wi-Fi が一度切れます。つなぎ直してください。</small></section>"
+"<section id=ethsec hidden><h2>有線 LAN 設定</h2><form id=ef>"
+"<label><input type=radio name=mode value=dhcp style=width:auto> 自動（DHCP）</label>"
+"<label><input type=radio name=mode value=static style=width:auto> 固定</label>"
+"<label>IP アドレス</label><input name=ip inputmode=decimal>"
+"<label>サブネットマスク</label><input name=mask inputmode=decimal>"
+"<label>デフォルトゲートウェイ（空欄なら使わない）</label><input name=gw inputmode=decimal>"
+"<button>保存</button><span id=emsg></span></form>"
+"<small>保存すると有線 LAN のアドレスが切り替わります。有線でこのページを開いている場合は、新しいアドレスで開き直してください。"
+"固定のときのアドレスは、自動に戻しても残ります。</small></section><script>"
 "const TK='" PAGE_TOKEN_MARK "';"   /* replaced by the per-boot token when served */
-"const $=i=>document.getElementById(i);let P=null,ssidSet=false;"
+"const $=i=>document.getElementById(i);let P=null,ssidSet=false,ethSet=false;"
 "const row=(k,v)=>'<tr><th>'+k+'</th><td>'+v+'</td></tr>';"
 "const esc=s=>String(s).replace(/[&<>\"']/g,c=>'&#'+c.charCodeAt(0)+';');"
 "const mm=s=>Math.floor(s/60)+':'+String(s%60).padStart(2,'0');"
@@ -100,10 +113,13 @@ static const char PAGE[] =
 "'（コマ落ち '+R.drop+'、音声欠け '+R.adrop+'）':{idle:'停止中',nocard:'SD カードがありません',error:'書き込みエラーで停止',full:'ファイル番号が上限（R9999）です'}[R.state]);"
 "const W=s.wifi;r+=row('アクセスポイント',esc(W.ap_ssid)+'（'+W.ap_ip+'、接続 '+W.ap_clients+' 台）');"
 "r+=row('接続先',!W.sta?'設定なし':esc(W.sta_ssid)+(W.sta_conn?'：'+W.sta_ip+'（'+W.rssi+' dBm、ch'+W.ch+'）':'：接続を試みています'));"
+"const E=s.eth;r+=row('有線 LAN',!E.on?'モジュールなし':!E.link?'ケーブル未接続':(E.ip!='0.0.0.0'?E.ip+'（'+(E.dhcp?'自動':'固定')+'）':'アドレス取得中'));"
 "r+=row('C6 ファーム',W.c6||'-');"
 "r+=row('空きメモリ','内部 '+s.heap.int+' KB、PSRAM '+s.heap.psram+' KB');"
 "r+=row('稼働時間',Math.floor(s.up/60000)+' 分');"
-"$('st').innerHTML=r;if(!ssidSet){$('ssid').value=W.sta_ssid;ssidSet=true}P=s}catch(e){}}"
+"$('st').innerHTML=r;if(!ssidSet){$('ssid').value=W.sta_ssid;ssidSet=true}"
+"if(E.on&&!ethSet){const f=$('ef');f.mode.value=E.dhcp?'dhcp':'static';f.ip.value=E.cip;f.mask.value=E.cmask;"
+"f.gw.value=E.cgw=='0.0.0.0'?'':E.cgw;$('ethsec').hidden=false;ethSet=true}P=s}catch(e){}}"
 "async function files(){const t=$('files');t.innerHTML='<tr><td>読み込み中…</td></tr>';"
 "try{const d=await(await fetch('/api/files')).json();"
 "if(!d.card){$('card').textContent='SD カードがありません';t.innerHTML='';return}"
@@ -132,6 +148,10 @@ static const char PAGE[] =
 "try{const r=await fetch('/api/settings',{method:'POST',headers:{'X-Tab5-Token':TK},body:new URLSearchParams(new FormData($('f')))});"
 "$('msg').textContent=r.ok?'保存しました。Wi-Fi を再起動します。':'保存できません：'+await r.text()}"
 "catch(e){$('msg').textContent='送信できませんでした'}};"
+"$('ef').onsubmit=async e=>{e.preventDefault();$('emsg').textContent='保存中…';"
+"try{const r=await fetch('/api/eth',{method:'POST',headers:{'X-Tab5-Token':TK},body:new URLSearchParams(new FormData($('ef')))});"
+"$('emsg').textContent=r.ok?'保存しました。有線 LAN の設定を切り替えます。':'保存できません：'+await r.text()}"
+"catch(e){$('emsg').textContent='送信できませんでした'}};"
 "status();files();setInterval(status,2000);"
 "</script>";
 
@@ -199,9 +219,15 @@ static esp_err_t send_text(httpd_req_t *req, const char *status, const char *tex
 
 /* ---- handlers ------------------------------------------------------------------ */
 
+static bool host_allowed(httpd_req_t *req);
+static esp_err_t refuse_host(httpd_req_t *req);
+
 /* The page carries the per-boot token in place of PAGE_TOKEN_MARK. */
 static esp_err_t page_get(httpd_req_t *req)
 {
+    if (!host_allowed(req)) {
+        return refuse_host(req);
+    }
     httpd_resp_set_type(req, "text/html; charset=utf-8");
     httpd_resp_set_hdr(req, "Cache-Control", "no-store");
     const char *mark = strstr(PAGE, PAGE_TOKEN_MARK);
@@ -213,6 +239,48 @@ static esp_err_t page_get(httpd_req_t *req)
     if (err == ESP_OK) err = httpd_resp_send_chunk(req, mark + strlen(PAGE_TOKEN_MARK), HTTPD_RESP_USE_STRLEN);
     if (err == ESP_OK) err = httpd_resp_send_chunk(req, NULL, 0);
     return err;
+}
+
+/* DNS rebinding: a foreign page whose name now points at this device would be
+ * same-origin with it and could read the token. Its requests still carry the
+ * foreign name in Host, so only this device's own names are served. */
+static bool host_allowed(httpd_req_t *req)
+{
+    char host[80];
+    if (httpd_req_get_hdr_value_str(req, "Host", host, sizeof(host)) != ESP_OK) {
+        return false;   /* missing, or too long for any of our names */
+    }
+    char *port = strrchr(host, ':');
+    if (port && strcmp(port, ":80") == 0) {
+        *port = '\0';
+    }
+    if (strcasecmp(host, APP_WIFI_HOSTNAME ".local") == 0 || strcasecmp(host, APP_WIFI_HOSTNAME) == 0) {
+        return true;
+    }
+    net_status_t net;
+    net_wifi_get_status(&net);
+    char ip[16];
+    esp_ip4_addr_t a = { .addr = net.ap_ip };
+    snprintf(ip, sizeof(ip), IPSTR, IP2STR(&a));
+    if (net.ap_ip && strcmp(host, ip) == 0) {
+        return true;
+    }
+    a.addr = net.sta_ip;
+    snprintf(ip, sizeof(ip), IPSTR, IP2STR(&a));
+    if (net.sta_ip && strcmp(host, ip) == 0) {
+        return true;
+    }
+    eth_status_t eth;
+    net_eth_get_status(&eth);
+    a.addr = eth.ip;
+    snprintf(ip, sizeof(ip), IPSTR, IP2STR(&a));
+    return eth.ip && strcmp(host, ip) == 0;
+}
+
+static esp_err_t refuse_host(httpd_req_t *req)
+{
+    ESP_LOGW(TAG, "request for a foreign host name refused");
+    return send_text(req, "403 Forbidden", "Forbidden");
 }
 
 /* Changing requests (delete, settings) must come from this device's own page:
@@ -235,8 +303,10 @@ static bool request_allowed(httpd_req_t *req)
         return false;
     }
     char origin[96], host[80];
-    if (httpd_req_get_hdr_value_str(req, "Origin", origin, sizeof(origin)) == ESP_OK) {
-        if (httpd_req_get_hdr_value_str(req, "Host", host, sizeof(host)) != ESP_OK ||
+    if (httpd_req_get_hdr_value_len(req, "Origin") > 0) {
+        /* Present: it must fit and match (a truncated one is refused, not skipped). */
+        if (httpd_req_get_hdr_value_str(req, "Origin", origin, sizeof(origin)) != ESP_OK ||
+            httpd_req_get_hdr_value_str(req, "Host", host, sizeof(host)) != ESP_OK ||
             strncmp(origin, "http://", 7) != 0 || strcmp(origin + 7, host) != 0) {
             return false;
         }
@@ -244,8 +314,32 @@ static bool request_allowed(httpd_req_t *req)
     return true;
 }
 
+/* Request body into buf (len bytes). A stalled client gets a few receive
+ * timeouts, not an endless wait: the server has a single task. */
+static esp_err_t recv_body(httpd_req_t *req, char *buf, size_t len)
+{
+    size_t got = 0;
+    int timeouts = 0;
+    while (got < len) {
+        int n = httpd_req_recv(req, buf + got, len - got);
+        if (n == HTTPD_SOCK_ERR_TIMEOUT && ++timeouts < 3) {
+            continue;
+        }
+        if (n <= 0) {
+            return ESP_FAIL;
+        }
+        timeouts = 0;
+        got += n;
+    }
+    buf[got] = '\0';
+    return ESP_OK;
+}
+
 static esp_err_t status_get(httpd_req_t *req)
 {
+    if (!host_allowed(req)) {
+        return refuse_host(req);
+    }
     frame_mbox_stats_t cam, uvc;
     frame_mbox_get_stats(cam_builtin_mbox(), &cam);
     frame_mbox_get_stats(cam_uvc_mbox(), &uvc);
@@ -257,6 +351,10 @@ static esp_err_t status_get(httpd_req_t *req)
     recorder_get_stats(&rec);
     net_status_t net;
     net_wifi_get_status(&net);
+    eth_status_t eth;
+    net_eth_get_status(&eth);
+    esp_ip4_addr_t eip = { .addr = eth.ip }, ecip = { .addr = eth.cfg_ip }, ecmask = { .addr = eth.cfg_mask },
+                   ecgw = { .addr = eth.cfg_gw };
 
     static const char *const rec_state[] = { "idle", "rec", "nocard", "error", "full" };
     char ssid[3 * 33 + 8];
@@ -265,7 +363,7 @@ static esp_err_t status_get(httpd_req_t *req)
     json_escape(c6, sizeof(c6), net.c6_version);
     esp_ip4_addr_t ap_ip = { .addr = net.ap_ip }, sta_ip = { .addr = net.sta_ip };
 
-    char json[1024];
+    char json[1280];
     int n = snprintf(json, sizeof(json),
         "{\"up\":%" PRId64 ",\"cam\":%" PRIu32 ",\"disp\":%" PRIu32 ","
         "\"uvc\":{\"on\":%s,\"w\":%u,\"h\":%u,\"dec\":%" PRIu32 "},"
@@ -273,12 +371,16 @@ static esp_err_t status_get(httpd_req_t *req)
         ",\"drop\":%" PRIu32 ",\"adrop\":%" PRIu32 ",\"bytes\":%" PRIu64 "},"
         "\"wifi\":{\"ap_ssid\":\"%s\",\"ap_ip\":\"" IPSTR "\",\"ap_clients\":%u,\"sta\":%s,\"sta_ssid\":\"%s\","
         "\"sta_conn\":%s,\"sta_ip\":\"" IPSTR "\",\"rssi\":%d,\"ch\":%u,\"c6\":\"%s\"},"
+        "\"eth\":{\"on\":%s,\"link\":%s,\"dhcp\":%s,\"ip\":\"" IPSTR "\",\"cip\":\"" IPSTR "\","
+        "\"cmask\":\"" IPSTR "\",\"cgw\":\"" IPSTR "\"},"
         "\"heap\":{\"int\":%u,\"psram\":%u}}",
         esp_timer_get_time() / 1000, cam.published, disp.flips,
         rx.streaming ? "true" : "false", rx.w, rx.h, uvc.published,
         rec_state[rec.state], rec.file_no, rec.seconds, rec.frames, rec.frames_dropped, rec.audio_dropped, rec.bytes,
         APP_WIFI_AP_SSID, IP2STR(&ap_ip), net.ap_clients, net.sta_configured ? "true" : "false", ssid,
         net.sta_connected ? "true" : "false", IP2STR(&sta_ip), net.sta_rssi, net.channel, c6,
+        eth.present ? "true" : "false", eth.link ? "true" : "false", eth.dhcp ? "true" : "false", IP2STR(&eip),
+        IP2STR(&ecip), IP2STR(&ecmask), IP2STR(&ecgw),
         (unsigned)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024),
         (unsigned)(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024));
     httpd_resp_set_type(req, "application/json");
@@ -288,6 +390,9 @@ static esp_err_t status_get(httpd_req_t *req)
 
 static esp_err_t files_get(httpd_req_t *req)
 {
+    if (!host_allowed(req)) {
+        return refuse_host(req);
+    }
     httpd_resp_set_type(req, "application/json");
     httpd_resp_set_hdr(req, "Cache-Control", "no-store");
     if (!recorder_card_acquire(pdMS_TO_TICKS(2000))) {
@@ -442,6 +547,9 @@ done:
 
 static esp_err_t rec_get(httpd_req_t *req)
 {
+    if (!host_allowed(req)) {
+        return refuse_host(req);
+    }
     const char *name = req->uri + strlen("/rec/");
     char clean[16];
     strlcpy(clean, name, sizeof(clean));
@@ -490,6 +598,9 @@ static esp_err_t rec_get(httpd_req_t *req)
  * downloaded; reports each refusal. */
 static esp_err_t delete_post(httpd_req_t *req)
 {
+    if (!host_allowed(req)) {
+        return refuse_host(req);
+    }
     if (!request_allowed(req)) {
         ESP_LOGW(TAG, "delete refused: missing or wrong token, or foreign origin");
         return send_text(req, "403 Forbidden", "このページから操作してください（ページを再読み込みしてください）");
@@ -501,29 +612,17 @@ static esp_err_t delete_post(httpd_req_t *req)
     if (!body) {
         return send_text(req, "500 Internal Server Error", "メモリが足りません");
     }
-    size_t got = 0;
-    while (got < req->content_len) {
-        int n = httpd_req_recv(req, body + got, req->content_len - got);
-        if (n == HTTPD_SOCK_ERR_TIMEOUT) {
-            continue;
-        }
-        if (n <= 0) {
-            free(body);
-            return ESP_FAIL;
-        }
-        got += n;
-    }
-    body[got] = '\0';
-
-    if (!recorder_card_acquire(pdMS_TO_TICKS(5000))) {
+    if (recv_body(req, body, req->content_len) != ESP_OK) {
         free(body);
-        return send_text(req, "503 Service Unavailable", "SD カードがありません");
+        return ESP_FAIL;
     }
+
     unsigned deleted = 0;
     uint64_t freed = 0;
     char out[1024];
     int o = snprintf(out, sizeof(out), "{\"skipped\":[");
     bool first = true;
+    bool card = true;
     char *save = NULL;
     for (char *name = strtok_r(body, "\r\n", &save); name; name = strtok_r(NULL, "\r\n", &save)) {
         uint32_t no;
@@ -549,9 +648,16 @@ static esp_err_t delete_post(httpd_req_t *req)
         char path[48];
         snprintf(path, sizeof(path), APP_REC_DIR "/%.9s", name);
         if (!why) {
+            /* The card lock per file, so a running download is not starved. */
+            if (!recorder_card_acquire(pdMS_TO_TICKS(5000))) {
+                card = false;
+                break;
+            }
             struct stat st;
             long size = stat(path, &st) == 0 ? (long)st.st_size : 0;
-            if (unlink(path) == 0) {
+            int gone = unlink(path);
+            recorder_card_release();
+            if (gone == 0) {
                 deleted++;
                 freed += size;
                 ESP_LOGI(TAG, "deleted %s (%ld bytes)", name, size);
@@ -559,20 +665,47 @@ static esp_err_t delete_post(httpd_req_t *req)
             }
             why = "gone";
         }
-        if (o < (int)sizeof(out) - 40) {
+        /* Leave room for the closing part below (about 50 bytes). */
+        if (o < (int)sizeof(out) - 96) {
             o += snprintf(out + o, sizeof(out) - o, "%s{\"n\":\"%.9s\",\"why\":\"%s\"}", first ? "" : ",", name, why);
             first = false;
         }
     }
-    recorder_card_release();
     free(body);
+    if (!card && deleted == 0) {
+        return send_text(req, "503 Service Unavailable", "SD カードがありません");
+    }
     snprintf(out + o, sizeof(out) - o, "],\"deleted\":%u,\"freed\":%" PRIu64 "}", deleted, freed);
     httpd_resp_set_type(req, "application/json");
     return httpd_resp_sendstr(req, out);
 }
 
+/* httpd_query_key_value: ESP_ERR_NOT_FOUND (absent) is fine, anything but
+ * ESP_OK otherwise (value too long) must not pass as "not given". */
+static bool form_value(const char *body, const char *key, char *dst, size_t size, bool *present)
+{
+    esp_err_t err = httpd_query_key_value(body, key, dst, size);
+    *present = err == ESP_OK;
+    return err == ESP_OK || err == ESP_ERR_NOT_FOUND;
+}
+
+/* %XX with two hex digits only. False for a malformed escape. */
+static bool url_decode_checked(char *s)
+{
+    for (const char *p = s; *p; p++) {
+        if (*p == '%' && !(isxdigit((unsigned char)p[1]) && isxdigit((unsigned char)p[2]))) {
+            return false;
+        }
+    }
+    url_decode(s);
+    return true;
+}
+
 static esp_err_t settings_post(httpd_req_t *req)
 {
+    if (!host_allowed(req)) {
+        return refuse_host(req);
+    }
     if (!request_allowed(req)) {
         ESP_LOGW(TAG, "settings refused: missing or wrong token, or foreign origin");
         return send_text(req, "403 Forbidden", "このページから操作してください（ページを再読み込みしてください）");
@@ -581,27 +714,23 @@ static esp_err_t settings_post(httpd_req_t *req)
         return send_text(req, "400 Bad Request", "入力が長すぎます");
     }
     char body[SETTINGS_BODY_MAX + 1];
-    size_t got = 0;
-    while (got < req->content_len) {
-        int n = httpd_req_recv(req, body + got, req->content_len - got);
-        if (n == HTTPD_SOCK_ERR_TIMEOUT) {
-            continue;
-        }
-        if (n <= 0) {
-            return ESP_FAIL;
-        }
-        got += n;
+    if (recv_body(req, body, req->content_len) != ESP_OK) {
+        return ESP_FAIL;
     }
-    body[got] = '\0';
 
     char ap_pass[3 * 64 + 1] = "", sta_ssid[3 * 33 + 1] = "", sta_pass[3 * 64 + 1] = "";
-    bool has_ssid = httpd_query_key_value(body, "sta_ssid", sta_ssid, sizeof(sta_ssid)) == ESP_OK;
-    httpd_query_key_value(body, "ap_pass", ap_pass, sizeof(ap_pass));
-    httpd_query_key_value(body, "sta_pass", sta_pass, sizeof(sta_pass));
+    bool has_ssid, has_ap_pass, has_sta_pass;
+    bool ok = form_value(body, "sta_ssid", sta_ssid, sizeof(sta_ssid), &has_ssid) &&
+              form_value(body, "ap_pass", ap_pass, sizeof(ap_pass), &has_ap_pass) &&
+              form_value(body, "sta_pass", sta_pass, sizeof(sta_pass), &has_sta_pass);
     memset(body, 0, sizeof(body));
-    url_decode(ap_pass);
-    url_decode(sta_ssid);
-    url_decode(sta_pass);
+    ok = ok && url_decode_checked(ap_pass) && url_decode_checked(sta_ssid) && url_decode_checked(sta_pass);
+    if (!ok) {
+        memset(ap_pass, 0, sizeof(ap_pass));
+        memset(sta_pass, 0, sizeof(sta_pass));
+        return send_text(req, "400 Bad Request",
+                         "パスワードは8〜63文字の半角英数字・記号、ネットワーク名は32バイト以内にしてください");
+    }
 
     net_status_t net;
     net_wifi_get_status(&net);
@@ -622,9 +751,52 @@ static esp_err_t settings_post(httpd_req_t *req)
     return send_text(req, "200 OK", "OK");
 }
 
+/* POST /api/eth, form fields mode=dhcp|static, ip, mask, gw (gw may be empty). */
+static esp_err_t eth_post(httpd_req_t *req)
+{
+    if (!host_allowed(req)) {
+        return refuse_host(req);
+    }
+    if (!request_allowed(req)) {
+        ESP_LOGW(TAG, "LAN settings refused: missing or wrong token, or foreign origin");
+        return send_text(req, "403 Forbidden", "このページから操作してください（ページを再読み込みしてください）");
+    }
+    if (req->content_len == 0 || req->content_len > ETH_BODY_MAX) {
+        return send_text(req, "400 Bad Request", "入力が長すぎます");
+    }
+    char body[ETH_BODY_MAX + 1];
+    if (recv_body(req, body, req->content_len) != ESP_OK) {
+        return ESP_FAIL;
+    }
+    char mode[8] = "", ip[20] = "", mask[20] = "", gw[20] = "";
+    httpd_query_key_value(body, "mode", mode, sizeof(mode));
+    httpd_query_key_value(body, "ip", ip, sizeof(ip));
+    httpd_query_key_value(body, "mask", mask, sizeof(mask));
+    httpd_query_key_value(body, "gw", gw, sizeof(gw));
+    const bool dhcp = strcmp(mode, "dhcp") == 0;
+    if (!dhcp && strcmp(mode, "static") != 0) {
+        return send_text(req, "400 Bad Request", "自動か固定かを選んでください");
+    }
+    esp_ip4_addr_t a_ip = {0}, a_mask = {0}, a_gw = {0};
+    if (!dhcp && (esp_netif_str_to_ip4(ip, &a_ip) != ESP_OK || esp_netif_str_to_ip4(mask, &a_mask) != ESP_OK ||
+                  (gw[0] && esp_netif_str_to_ip4(gw, &a_gw) != ESP_OK))) {
+        return send_text(req, "400 Bad Request", "アドレスは 192.168.1.100 のように数字4つで書いてください");
+    }
+    esp_err_t err = net_eth_save_settings(dhcp, a_ip.addr, a_mask.addr, a_gw.addr);
+    if (err == ESP_ERR_INVALID_ARG) {
+        return send_text(req, "400 Bad Request",
+                         "アドレスの組み合わせが正しくありません（マスク、ネットワーク・ブロードキャストアドレス、"
+                         "ゲートウェイが同じネットワークにあるか）");
+    }
+    if (err != ESP_OK) {
+        return send_text(req, "500 Internal Server Error", "保存に失敗しました");
+    }
+    return send_text(req, "200 OK", "OK");
+}
+
 /* ---- public -------------------------------------------------------------------- */
 
-esp_err_t web_server_start(void)
+static esp_err_t server_start(void)
 {
     if (s_server) {
         /* Left running by a stop that timed out: in use again, accept downloads. */
@@ -679,6 +851,7 @@ esp_err_t web_server_start(void)
         { .uri = "/rec/*",        .method = HTTP_GET,  .handler = rec_get },
         { .uri = "/api/settings", .method = HTTP_POST, .handler = settings_post },
         { .uri = "/api/delete",   .method = HTTP_POST, .handler = delete_post },
+        { .uri = "/api/eth",      .method = HTTP_POST, .handler = eth_post },
     };
     for (size_t i = 0; i < sizeof(uris) / sizeof(uris[0]); i++) {
         httpd_register_uri_handler(s_server, &uris[i]);
@@ -687,7 +860,7 @@ esp_err_t web_server_start(void)
     return ESP_OK;
 }
 
-esp_err_t web_server_stop(void)
+static esp_err_t server_stop(void)
 {
     if (!s_server) {
         return ESP_OK;
@@ -721,4 +894,47 @@ esp_err_t web_server_stop(void)
     }
     s_server = NULL;
     return ESP_OK;
+}
+
+/* Start and stop come from the Wi-Fi task and from the LAN set-up: one at a time. */
+static SemaphoreHandle_t life_lock(void)
+{
+    static StaticSemaphore_t buf;
+    static SemaphoreHandle_t lock;
+    static portMUX_TYPE mux = portMUX_INITIALIZER_UNLOCKED;
+    taskENTER_CRITICAL(&mux);
+    if (!lock) {
+        lock = xSemaphoreCreateMutexStatic(&buf);
+    }
+    taskEXIT_CRITICAL(&mux);
+    return lock;
+}
+
+static unsigned s_users;    /* web_user_t bits; under life_lock() */
+
+esp_err_t web_server_start(web_user_t user)
+{
+    xSemaphoreTake(life_lock(), portMAX_DELAY);
+    esp_err_t err = server_start();
+    if (err == ESP_OK) {
+        s_users |= user;
+    }
+    xSemaphoreGive(life_lock());
+    return err;
+}
+
+esp_err_t web_server_stop(web_user_t user)
+{
+    xSemaphoreTake(life_lock(), portMAX_DELAY);
+    esp_err_t err = ESP_OK;
+    if (s_users & ~(unsigned)user) {
+        s_users &= ~(unsigned)user;     /* another interface still serves the page */
+    } else {
+        err = server_stop();
+        if (err == ESP_OK) {
+            s_users = 0;
+        }
+    }
+    xSemaphoreGive(life_lock());
+    return err;
 }

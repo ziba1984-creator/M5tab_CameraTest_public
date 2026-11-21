@@ -13,6 +13,12 @@ idf_component_register(
         "recorder.c"
         "net_wifi.c"
         "web_server.c"
+        "stack_probe.c"
+        "m5bus.c"
+        "net_eth.c"
+        "ui_draw.c"
+        "modules.c"
+        "measure_ui.c"
     INCLUDE_DIRS "."
     PRIV_REQUIRES
         esp_lcd
@@ -37,4 +43,8 @@ idf_component_register(
         lwip
         espressif__esp_hosted
         espressif__mdns
+        esp_driver_spi
+        esp_driver_gpio
+        espressif__esp_io_expander
+        esp_eth
 )

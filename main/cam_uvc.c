@@ -30,6 +30,7 @@ typedef enum { EVT_CONNECTED, EVT_DISCONNECTED, EVT_POWER_CYCLE } evt_kind_t;
 typedef struct {
     evt_kind_t kind;
     uint8_t addr, idx;
+    uvc_host_stream_hdl_t hdl;  /* EVT_DISCONNECTED: the stream that lost its device */
 } mgr_evt_t;
 
 typedef struct {
@@ -67,6 +68,9 @@ static size_t s_jpg_cap;
 static uint8_t *s_fb[APP_UVC_FRAME_BUFS]; /* frame buffers of the open YUY2 stream */
 static volatile TickType_t s_last_rx;   /* tick of the last received frame (stall watchdog) */
 static int s_open_failures;             /* consecutive failed opens of a present camera */
+static volatile bool s_cycle_req;       /* a settings change asked for a power cycle */
+/* USB addresses of cameras without a usable mode: not retried until they re-enumerate. */
+static uint32_t s_unusable[128 / 32];
 
 /* ---- callbacks ------------------------------------------------------------ */
 
@@ -86,7 +90,7 @@ static void on_stream_event(const uvc_host_stream_event_data_t *event, void *ctx
 {
     switch (event->type) {
     case UVC_HOST_DEVICE_DISCONNECTED: {
-        mgr_evt_t e = { .kind = EVT_DISCONNECTED };
+        mgr_evt_t e = { .kind = EVT_DISCONNECTED, .hdl = event->device_disconnected.stream_hdl };
         xQueueSend(s_evt_q, &e, 0);
         break;
     }
@@ -192,13 +196,15 @@ static esp_err_t yuy2_convert(const uint8_t *src, size_t len, uint8_t *out, size
     return ESP_OK;
 }
 
-/* Convert `data` (JPEG, or raw YUY2 when there is no encoder) for the display. */
-static void decode_and_publish(const uint8_t *data, size_t len, bool raw_yuy2)
+/* Convert `data` (JPEG, or raw YUY2 when there is no encoder) for the display.
+ * Returns false only when the frame itself is broken; a frame skipped for lack
+ * of an output buffer was not checked and counts as good. */
+static bool decode_and_publish(const uint8_t *data, size_t len, bool raw_yuy2)
 {
     int idx;
     if (xQueueReceive(s_out_free_q, &idx, 0) != pdTRUE) {
         STATS(s_stats.no_buffer++);
-        return;
+        return true;
     }
     jpeg_dec_result_t r;
     int64_t t0 = esp_timer_get_time();
@@ -214,7 +220,7 @@ static void decode_and_publish(const uint8_t *data, size_t len, bool raw_yuy2)
                      esp_err_to_name(err), (unsigned)len);
         }
         xQueueSend(s_out_free_q, &idx, 0);
-        return;
+        return false;
     }
     STATS(s_stats.decoded++);
 #if APP_UVC_CTRL_TEST
@@ -229,6 +235,7 @@ static void decode_and_publish(const uint8_t *data, size_t len, bool raw_yuy2)
         .priv = (void *)(intptr_t)idx,
     };
     frame_mbox_publish(s_mbox, &out);
+    return true;
 }
 
 /* YUY2 frame: hardware JPEG once, then record it and/or show it. */
@@ -294,8 +301,11 @@ static void decode_task(void *arg)
                 if (s_format == UVC_VS_FORMAT_YUY2) {
                     process_yuy2(item.frame, item.show);
                 } else {
-                    recorder_push_jpeg(item.frame->data, item.frame->data_len, esp_timer_get_time());
-                    decode_and_publish(item.frame->data, item.frame->data_len, false);
+                    /* Decode first so a broken frame is not recorded. */
+                    int64_t t_rx = esp_timer_get_time();
+                    if (decode_and_publish(item.frame->data, item.frame->data_len, false)) {
+                        recorder_push_jpeg(item.frame->data, item.frame->data_len, t_rx);
+                    }
                 }
                 uvc_host_frame_return(s_stream, (uvc_host_frame_t *)item.frame);
             } else {
@@ -550,12 +560,24 @@ static esp_err_t try_open(uint8_t addr, uint8_t idx)
     if (open_err != ESP_OK) {
         free_frame_buffers();
         ESP_LOGE(TAG, "stream open failed (%s)", esp_err_to_name(open_err));
-        return open_err;
+        /* ESP_ERR_NOT_SUPPORTED is reserved for "no usable mode": a failed
+         * negotiation may be a wedged camera, which a power cycle can fix. */
+        return open_err == ESP_ERR_NOT_SUPPORTED ? ESP_FAIL : open_err;
     }
 
     uvc_host_stream_format_t actual = { 0 };
     if (uvc_host_stream_format_get(hdl, &actual) == ESP_OK) {
         ESP_LOGI(TAG, "camera accepted %ux%u @ %.1f fps", actual.h_res, actual.v_res, actual.fps);
+        if (yuy2 && (actual.h_res != fmt.h_res || actual.v_res != fmt.v_res)) {
+            /* YUY2 frames are sized from the requested mode; every frame would be rejected. */
+            ESP_LOGE(TAG, "camera changed the YUY2 size to %ux%u", actual.h_res, actual.v_res);
+            if (uvc_host_stream_close(hdl) == ESP_OK) {
+                free_frame_buffers();
+            } else {
+                memset(s_fb, 0, sizeof(s_fb));
+            }
+            return ESP_ERR_NOT_SUPPORTED;
+        }
         STATS(s_stats.w = actual.h_res; s_stats.h = actual.v_res);
     }
 #if APP_UVC_CTRL_PROBE
@@ -581,6 +603,10 @@ static esp_err_t try_open(uint8_t addr, uint8_t idx)
     s_last_rx = xTaskGetTickCount();
     STATS(s_stats.streaming = true);
     ESP_LOGI(TAG, "streaming");
+    /* A recording of this camera continues only with the same frame size. */
+    uint16_t w, h;
+    STATS(w = s_stats.w; h = s_stats.h);
+    recorder_uvc_size(w, h);
     return ESP_OK;
 }
 
@@ -588,12 +614,14 @@ static void close_stream(void)
 {
     /* Stop callbacks first. uvc_host_stream_stop() pauses the stream before
      * waiting for in-flight USB transfers, so no new user-owned frame can be
-     * queued after it returns. Do not hold s_lock here: the decode task may
-     * need it to return a frame that was already being processed. */
+     * queued after it returns. s_lock is held only to read the handle: the
+     * decode task may need it to return a frame that was already being processed. */
     xSemaphoreTake(s_lock, portMAX_DELAY);
     uvc_host_stream_hdl_t hdl = s_stream;
     xSemaphoreGive(s_lock);
 
+    /* No new control transfers on a stream that is going away. */
+    cam_uvc_ctrl_forget();
     if (hdl) {
         esp_err_t err = uvc_host_stream_stop(hdl);
         if (err != ESP_OK) {
@@ -626,7 +654,6 @@ static void close_stream(void)
     }
 
     STATS(s_stats.streaming = false);
-    cam_uvc_ctrl_forget();
     if (hdl) {
         esp_err_t err = uvc_host_stream_close(hdl);
         if (err != ESP_OK) {
@@ -653,14 +680,23 @@ static void power_cycle_camera(const char *why)
     bsp_feature_enable(BSP_FEATURE_USB, true);
 }
 
-/* A camera that is present but cannot be opened several times in a row is wedged. */
-static void note_open_result(esp_err_t err)
+/* A camera that is present but cannot be opened several times in a row is wedged.
+ * One without a usable mode is not: power-cycling it would only repeat forever,
+ * so it is left alone until it re-enumerates. */
+static void note_open_result(uint8_t addr, esp_err_t err)
 {
     if (err == ESP_OK) {
         s_open_failures = 0;
-    } else if (err != ESP_ERR_NOT_FOUND && ++s_open_failures >= APP_UVC_OPEN_RETRIES) {
+    } else if (err == ESP_ERR_NOT_SUPPORTED) {
+        s_unusable[(addr & 127) / 32] |= 1UL << (addr % 32);
+    } else if (err != ESP_ERR_NOT_FOUND && err != ESP_ERR_NO_MEM && ++s_open_failures >= APP_UVC_OPEN_RETRIES) {
         power_cycle_camera("camera keeps failing to open");
     }
+}
+
+static bool addr_unusable(uint8_t addr)
+{
+    return s_unusable[(addr & 127) / 32] & (1UL << (addr % 32));
 }
 
 /* Open the first UVC device found among the already enumerated USB devices. */
@@ -671,8 +707,18 @@ static void scan_and_open(void)
     if (usb_host_device_addr_list_fill(sizeof(addrs), addrs, &count) != ESP_OK) {
         return;
     }
+    /* Forget unusable addresses whose device is gone. */
+    uint32_t present[128 / 32] = { 0 };
+    for (int i = 0; i < count; i++) {
+        present[(addrs[i] & 127) / 32] |= 1UL << (addrs[i] % 32);
+    }
+    for (int i = 0; i < 128 / 32; i++) {
+        s_unusable[i] &= present[i];
+    }
     for (int i = 0; i < count && !s_stream; i++) {
-        note_open_result(try_open(addrs[i], 0));
+        if (!addr_unusable(addrs[i])) {
+            note_open_result(addrs[i], try_open(addrs[i], 0));
+        }
     }
 }
 
@@ -704,21 +750,31 @@ static void manager_task(void *arg)
         }
         if (xQueueReceive(s_evt_q, &e, wait) == pdTRUE) {
             if (e.kind == EVT_DISCONNECTED) {
-                ESP_LOGW(TAG, "camera disconnected");
-                close_stream();
-            } else if (e.kind == EVT_POWER_CYCLE) {
-                /* Debounced: a burst of taps costs one restart. */
-                cycle_pending = true;
-                cycle_at = xTaskGetTickCount() + pdMS_TO_TICKS(APP_UVC_APPLY_DELAY_MS);
-            } else if (!s_stream) {
-                vTaskDelay(pdMS_TO_TICKS(300));     /* let the device settle after enumeration */
-                note_open_result(try_open(e.addr, e.idx));
+                /* Ignore a late event of a stream that was already closed. */
+                if (e.hdl && e.hdl == s_stream) {
+                    ESP_LOGW(TAG, "camera disconnected");
+                    close_stream();
+                }
+            } else if (e.kind == EVT_CONNECTED) {
+                s_unusable[(e.addr & 127) / 32] &= ~(1UL << (e.addr % 32));   /* a new device */
+                if (!s_stream) {
+                    vTaskDelay(pdMS_TO_TICKS(300));     /* let the device settle after enumeration */
+                    note_open_result(e.addr, try_open(e.addr, e.idx));
+                }
             }
         } else if (!s_stream) {
             scan_and_open();    /* safety net for missed connect events */
-        } else if (stream_stalled()) {
+        }
+        /* Checked on every pass, so a stream of events cannot hide a stall. */
+        if (stream_stalled()) {
             STATS(s_stats.stall_restarts++);
             power_cycle_camera("no frame for " STR(APP_UVC_STALL_MS) " ms");
+        }
+        if (s_cycle_req) {
+            /* Debounced: a burst of taps costs one restart. */
+            s_cycle_req = false;
+            cycle_pending = true;
+            cycle_at = xTaskGetTickCount() + pdMS_TO_TICKS(APP_UVC_APPLY_DELAY_MS);
         }
         if (cycle_pending && (int32_t)(xTaskGetTickCount() - cycle_at) >= 0) {
             cycle_pending = false;
@@ -738,8 +794,13 @@ static void manager_task(void *arg)
 
 void cam_uvc_request_power_cycle(void)
 {
-    mgr_evt_t e = { .kind = EVT_POWER_CYCLE };
-    xQueueSend(s_evt_q, &e, 0);
+    /* A flag, not a queued event: repeated requests cannot fill the queue and
+     * push out a disconnect. The event only wakes the manager. */
+    if (!s_cycle_req) {
+        s_cycle_req = true;
+        mgr_evt_t e = { .kind = EVT_POWER_CYCLE };
+        xQueueSend(s_evt_q, &e, 0);
+    }
 }
 
 

@@ -15,6 +15,8 @@
 #include "cam_uvc.h"
 #include "cam_uvc_ctrl.h"
 #include "camera_ui.h"
+#include "ui_draw.h"
+#include "measure_ui.h"
 #include "display_comp.h"
 #include "recorder.h"
 #include "net_wifi.h"
@@ -39,6 +41,7 @@ static const char *TAG = "camera_ui";
 #define UI_EVT_TAB      200     /* queue item: + page index */
 #define UI_EVT_SRC_IN   300     /* settings page: record the built-in camera */
 #define UI_EVT_SRC_UVC  301     /* settings page: record the UVC camera */
+#define UI_EVT_PAGE_TAP 1000000 /* measure page: + x * 1000 + y (page image coordinates) */
 
 /* Tabs and pages are drawn at half resolution like the bar (the display scales by 2). */
 #define UI_TAB_SRC_H    (CAMERA_UI_TAB_HEIGHT / 2)
@@ -123,101 +126,20 @@ static const char *const s_labels[UI_BUTTONS] = {
     "", "B-", "B+", "C-", "C+", "S-", "S+", "W-", "W+", "RST", "WIFI", "REC"
 };
 
-/* Five-bit rows, top to bottom. Only glyphs used by the compact control bar. */
-static void glyph_rows(char ch, uint8_t row[7])
+/* Drawing (ui_draw.c) at the bar's font scale. */
+static inline void put_rect(canvas_t *c, int x, int y, int w, int h, uint16_t color)
 {
-    static const uint8_t blank[7] = {0};
-    static const uint8_t digits[10][7] = {
-        {14,17,19,21,25,17,14}, {4,12,4,4,4,4,14}, {14,17,1,2,4,8,31}, {31,2,4,2,1,17,14},
-        {2,6,10,18,31,2,2}, {31,16,30,1,1,17,14}, {6,8,16,30,17,17,14}, {31,1,2,4,8,8,8},
-        {14,17,17,14,17,17,14}, {14,17,17,15,1,2,12},
-    };
-    const uint8_t *src = blank;
-    static const uint8_t a[7] = {14,17,17,31,17,17,17};
-    static const uint8_t b[7] = {30,17,17,30,17,17,30};
-    static const uint8_t c[7] = {14,17,16,16,16,17,14};
-    static const uint8_t d[7] = {28,18,17,17,17,18,28};
-    static const uint8_t e[7] = {31,16,16,30,16,16,31};
-    static const uint8_t f[7] = {31,16,16,30,16,16,16};
-    static const uint8_t i[7] = {14,4,4,4,4,4,14};
-    static const uint8_t l[7] = {16,16,16,16,16,16,31};
-    static const uint8_t n[7] = {17,25,21,19,17,17,17};
-    static const uint8_t o[7] = {14,17,17,17,17,17,14};
-    static const uint8_t p[7] = {30,17,17,30,16,16,16};
-    static const uint8_t r[7] = {30,17,17,30,20,18,17};
-    static const uint8_t s[7] = {15,16,16,14,1,1,30};
-    static const uint8_t t[7] = {31,4,4,4,4,4,4};
-    static const uint8_t u[7] = {17,17,17,17,17,17,14};
-    static const uint8_t v[7] = {17,17,17,17,17,10,4};
-    static const uint8_t w[7] = {17,17,17,21,21,21,10};
-    static const uint8_t plus[7] = {0,4,4,31,4,4,0};
-    static const uint8_t minus[7] = {0,0,0,31,0,0,0};
-    static const uint8_t colon[7] = {0,4,4,0,4,4,0};
-    static const uint8_t dot[7] = {0,0,0,0,0,12,12};
-    static const uint8_t g[7] = {14,17,16,23,17,17,15};
-    static const uint8_t h[7] = {17,17,17,31,17,17,17};
-    static const uint8_t j[7] = {7,2,2,2,2,18,12};
-    static const uint8_t k[7] = {17,18,20,24,20,18,17};
-    static const uint8_t m[7] = {17,27,21,21,17,17,17};
-    static const uint8_t q[7] = {14,17,17,17,21,18,13};
-    static const uint8_t x[7] = {17,17,10,4,10,17,17};
-    static const uint8_t y[7] = {17,17,10,4,4,4,4};
-    static const uint8_t z[7] = {31,1,2,4,8,16,31};
-    static const uint8_t slash[7] = {1,1,2,4,8,16,16};
-    switch (ch) {
-    case 'A': src = a; break; case 'B': src = b; break; case 'C': src = c; break;
-    case 'D': src = d; break; case 'E': src = e; break; case 'F': src = f; break;
-    case 'I': src = i; break; case 'L': src = l; break; case 'N': src = n; break; case 'O': src = o; break; case 'P': src = p; break;
-    case 'R': src = r; break; case 'S': src = s; break; case 'T': src = t; break;
-    case 'U': src = u; break; case 'V': src = v; break; case 'W': src = w; break;
-    case '+': src = plus; break; case '-': src = minus; break; case ':': src = colon; break;
-    case '.': src = dot; break;
-    case 'G': src = g; break; case 'H': src = h; break; case 'J': src = j; break;
-    case 'K': src = k; break; case 'M': src = m; break; case 'Q': src = q; break;
-    case 'X': src = x; break; case 'Y': src = y; break; case 'Z': src = z; break;
-    case '/': src = slash; break;
-    default:
-        if (ch >= '0' && ch <= '9') src = digits[ch - '0'];
-        break;
-    }
-    memcpy(row, src, 7);
+    ui_rect(c, x, y, w, h, color);
 }
 
-/* An RGB565 image being drawn (one of the UI images). */
-typedef struct {
-    uint16_t *px;
-    int w, h;
-} canvas_t;
-
-static void put_rect(canvas_t *c, int x, int y, int w, int h, uint16_t color)
+static inline void put_text(canvas_t *c, int x, int y, const char *text, uint16_t color)
 {
-    if (x < 0 || y < 0 || w <= 0 || h <= 0 || x + w > c->w || y + h > c->h) return;
-    for (int yy = y; yy < y + h; yy++) {
-        for (int xx = x; xx < x + w; xx++) c->px[yy * c->w + xx] = color;
-    }
+    ui_text(c, x, y, text, color, UI_FONT_SCALE);
 }
 
-static void put_text(canvas_t *c, int x, int y, const char *text, uint16_t color)
+static inline void put_text_centered(canvas_t *c, int x0, int x1, int y, const char *text, uint16_t color)
 {
-    for (; *text; text++, x += 6 * UI_FONT_SCALE) {
-        uint8_t rows[7];
-        glyph_rows(*text, rows);
-        for (int gy = 0; gy < 7; gy++) {
-            for (int gx = 0; gx < 5; gx++) {
-                if (rows[gy] & (1 << (4 - gx))) {
-                    put_rect(c, x + gx * UI_FONT_SCALE, y + gy * UI_FONT_SCALE,
-                             UI_FONT_SCALE, UI_FONT_SCALE, color);
-                }
-            }
-        }
-    }
-}
-
-/* Draw text horizontally centred in [x0, x1). */
-static void put_text_centered(canvas_t *c, int x0, int x1, int y, const char *text, uint16_t color)
-{
-    int tw = ((int)strlen(text) * 6 - 1) * UI_FONT_SCALE;
-    put_text(c, x0 + (x1 - x0 - tw) / 2, y, text, color);
+    ui_text_centered(c, x0, x1, y, text, color, UI_FONT_SCALE);
 }
 
 static int button_x(int i)
@@ -330,16 +252,16 @@ static void render_bar(canvas_t *c)
 
 /* ---- tabs and pages ------------------------------------------------------------ */
 
-static void render_tabs(canvas_t *c)
+static void render_tabs(canvas_t *c, camera_ui_page_t active)
 {
     put_rect(c, 0, 0, c->w, c->h, COLOR_TAB_BG);
     for (int i = 0; i < CAMERA_UI_PAGE_COUNT; i++) {
         int x0 = i * c->w / CAMERA_UI_PAGE_COUNT, x1 = (i + 1) * c->w / CAMERA_UI_PAGE_COUNT;
-        if (i == (int)s_page) {
+        if (i == (int)active) {
             put_rect(c, x0 + 1, 1, x1 - x0 - 2, c->h - 2, COLOR_TAB_ON);
         }
         put_text_centered(c, x0, x1, (c->h - 7 * UI_FONT_SCALE) / 2, s_tab_labels[i],
-                          i == (int)s_page ? COLOR_LABEL : COLOR_DIM);
+                          i == (int)active ? COLOR_LABEL : COLOR_DIM);
     }
 }
 
@@ -374,29 +296,25 @@ static void render_settings(canvas_t *c)
     }
 }
 
-static void render_measure(canvas_t *c)
-{
-    put_rect(c, 0, 0, c->w, c->h, COLOR_PAGE_BG);
-    put_text_centered(c, 0, c->w, c->h / 2 - 24, "MEASURE", COLOR_LABEL);
-    put_text_centered(c, 0, c->w, c->h / 2 + 4, "NO MODULE CONNECTED", COLOR_DIM);
-}
-
-/* Render the tabs and (off the camera page) the page into the back images. */
-static void publish_page(void)
+/* Render the tabs and (off the camera page) the page into the back images.
+ * The page switches together with its images, under s_lock: the display never
+ * sees the new page with the previous page's image. */
+static void publish_page(camera_ui_page_t page_id)
 {
     int tb = s_tab_front ^ 1, pb = s_page_front ^ 1;
     canvas_t tabs = { s_tab_buf[tb], UI_SRC_W, UI_TAB_SRC_H };
-    render_tabs(&tabs);
+    render_tabs(&tabs, page_id);
     canvas_t page = { s_page_buf[pb], UI_SRC_W, UI_PAGE_SRC_H };
-    if (s_page == CAMERA_UI_PAGE_SETTINGS) {
+    if (page_id == CAMERA_UI_PAGE_SETTINGS) {
         render_settings(&page);
-    } else if (s_page == CAMERA_UI_PAGE_MEASURE) {
-        render_measure(&page);
+    } else if (page_id == CAMERA_UI_PAGE_MEASURE) {
+        measure_ui_render(&page);
     }
     xSemaphoreTake(s_lock, portMAX_DELAY);
+    s_page = page_id;
     s_tab_front = tb;
     s_tab_frame.data = (uint8_t *)s_tab_buf[tb];
-    if (s_page != CAMERA_UI_PAGE_CAMERA) {
+    if (page_id != CAMERA_UI_PAGE_CAMERA) {
         s_page_front = pb;
         s_page_frame.data = (uint8_t *)s_page_buf[pb];
     }
@@ -531,13 +449,14 @@ static void uvc_adjust(int group, int direction)
 
 static void uvc_reset(void)
 {
+    /* Auto first: while it is on, the camera refuses its manual partner. */
+    if (s_uvc_auto_ok) {
+        cam_uvc_ctrl_set(CAM_UVC_CTRL_WB_TEMP_AUTO, s_uvc_auto.default_value);
+    }
     for (int g = 0; g < UI_GROUPS - 1; g++) {
         if (s_uvc_ok[g]) {
             cam_uvc_ctrl_set(s_uvc_ctrl[g], s_uvc[g].default_value);
         }
-    }
-    if (s_uvc_auto_ok) {
-        cam_uvc_ctrl_set(CAM_UVC_CTRL_WB_TEMP_AUTO, s_uvc_auto.default_value);
     }
     uvc_refresh();
     ESP_LOGI(TAG, "uvc controls reset: B=%" PRId32 " C=%" PRId32 " S=%" PRId32 " WB auto=%" PRId32,
@@ -614,12 +533,19 @@ static void ui_task(void *arg)
                 continue;
             }
             if (button >= UI_EVT_TAB && button < UI_EVT_TAB + CAMERA_UI_PAGE_COUNT) {
-                s_page = (camera_ui_page_t)(button - UI_EVT_TAB);
+                const camera_ui_page_t page = (camera_ui_page_t)(button - UI_EVT_TAB);
                 recorder_get_stats(&s_rec);
                 cam_uvc_get_stats(&s_uvc_seen);
-                ESP_LOGI(TAG, "page -> %s", s_tab_labels[s_page]);
-                publish_page();
+                ESP_LOGI(TAG, "page -> %s", s_tab_labels[page]);
+                publish_page(page);
                 publish_bar();
+                continue;
+            }
+            if (button >= UI_EVT_PAGE_TAP) {
+                int v = button - UI_EVT_PAGE_TAP;
+                if (s_page == CAMERA_UI_PAGE_MEASURE && measure_ui_tap(v / 1000, v % 1000)) {
+                    publish_page(s_page);
+                }
                 continue;
             }
             if (button == UI_EVT_SRC_IN || button == UI_EVT_SRC_UVC) {
@@ -629,7 +555,7 @@ static void ui_task(void *arg)
                 ESP_LOGI(TAG, "record source -> %s: %s", src == RECORDER_SRC_UVC ? "UVC" : "built-in",
                          esp_err_to_name(err));
                 recorder_get_stats(&s_rec);
-                publish_page();
+                publish_page(s_page);
                 publish_bar();
                 continue;
             }
@@ -664,8 +590,11 @@ static void ui_task(void *arg)
                           uvc.h != s_uvc_seen.h;
             s_uvc_seen = uvc;
         }
+        if (s_page == CAMERA_UI_PAGE_MEASURE) {
+            page_redraw |= measure_ui_poll();
+        }
         if (page_redraw) {
-            publish_page();
+            publish_page(s_page);
         }
         if (redraw) {
             publish_bar();
@@ -702,7 +631,7 @@ esp_err_t camera_ui_init(void)
     s_front = 0;
     s_frame = (video_frame_t){ .data = (uint8_t *)s_buf[0], .w = UI_SRC_W, .h = UI_SRC_H, .stride = UI_SRC_W };
     canvas_t tabs = { s_tab_buf[0], UI_SRC_W, UI_TAB_SRC_H };
-    render_tabs(&tabs);
+    render_tabs(&tabs, s_page);
     s_tab_front = 0;
     s_tab_frame = (video_frame_t){ .data = (uint8_t *)s_tab_buf[0], .w = UI_SRC_W, .h = UI_TAB_SRC_H, .stride = UI_SRC_W };
     s_page_front = 0;
@@ -726,6 +655,8 @@ void camera_ui_on_touch(uint16_t x, uint16_t y)
         if (y >= CAMERA_UI_Y && y < CAMERA_UI_Y + CAMERA_UI_HEIGHT) {
             item = (int)x * UI_BUTTONS / 1280;
         }
+    } else if (s_page == CAMERA_UI_PAGE_MEASURE) {
+        item = UI_EVT_PAGE_TAP + (x / 2) * 1000 + (y - CAMERA_UI_TAB_HEIGHT) / 2;
     } else if (s_page == CAMERA_UI_PAGE_SETTINGS) {
         int sx = x / 2, sy = (y - CAMERA_UI_TAB_HEIGHT) / 2;
         if (sy >= SET_BTN_Y && sy < SET_BTN_Y + SET_BTN_H) {

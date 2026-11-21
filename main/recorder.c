@@ -1,3 +1,4 @@
+#include <ctype.h>
 #include <dirent.h>
 #include <inttypes.h>
 #include <stdatomic.h>
@@ -36,8 +37,9 @@ typedef enum { ITEM_VIDEO, ITEM_AUDIO, ITEM_STOP } item_kind_t;
 typedef struct {
     uint8_t kind;
     uint8_t slot;
+    uint16_t gen;       /* recording the item belongs to */
     uint32_t len;
-    int64_t t_us;       /* capture time (video) */
+    int64_t t_us;       /* time the frame was taken from its source (video) */
 } item_t;
 
 /* Encoded frames and audio chunks wait in fixed slots; the free queues hold
@@ -53,16 +55,19 @@ static void *s_io_buf;
 
 static bool s_ready;                    /* recorder_init() completed */
 static atomic_bool s_active;            /* sources feed the write queue */
-static atomic_bool s_card;              /* microSD mounted; mounted/unmounted by the UI task only */
+static atomic_bool s_card;              /* microSD mounted; mounted by the UI task, unmounted by it or by the writer after a write error */
 static SemaphoreHandle_t s_card_mtx;    /* held by other readers of the card (web page) */
 static uint32_t s_next_no;              /* next file number (UI task, then writer) */
 static atomic_int s_source = RECORDER_SRC_BUILTIN;  /* camera for the next recording (UI task) */
 static atomic_bool s_uvc_active;        /* recording the UVC camera: recorder_push_jpeg() accepts frames */
 static uint16_t s_rec_w, s_rec_h;       /* frame size of the current recording (AVI header) */
+static atomic_uint s_gen;               /* bumped by every start; items of older recordings are dropped */
+static atomic_bool s_writer_busy;       /* from start until the writer has closed the last file */
 
 /* Owned by the writer task while recording. */
 static avi_writer_t *s_avi;
 static int64_t s_seg_first_us, s_seg_last_us;
+static int64_t s_free_checked_us;
 
 /* Written by the tasks without locking; readers only need approximate values. */
 static recorder_stats_t s_stats;
@@ -117,7 +122,8 @@ bool recorder_parse_name(const char *name, uint32_t *no)
     return true;
 }
 
-/* Rnnnn.AVI: continue after the highest number already on the card. */
+/* Rnnnn.AVI: continue after the highest number already on the card. FAT names
+ * ignore letter case, so r0002.avi copied from a PC takes up number 2 too. */
 static uint32_t next_file_no(void)
 {
     uint32_t max = 0;
@@ -125,8 +131,14 @@ static uint32_t next_file_no(void)
     if (dir) {
         struct dirent *e;
         while ((e = readdir(dir)) != NULL) {
+            char upper[16];
+            size_t i = 0;
+            for (; e->d_name[i] && i < sizeof(upper) - 1; i++) {
+                upper[i] = (char)toupper((unsigned char)e->d_name[i]);
+            }
+            upper[i] = '\0';
             uint32_t n;
-            if (recorder_parse_name(e->d_name, &n) && n > max) {
+            if (recorder_parse_name(upper, &n) && n > max) {
                 max = n;
             }
         }
@@ -135,14 +147,20 @@ static uint32_t next_file_no(void)
     return max + 1;
 }
 
-static esp_err_t open_file(uint32_t no)
+/* Below APP_REC_MIN_FREE_MB the file could not be finished with its index. */
+static bool card_has_room(void)
 {
-    if (no > APP_REC_MAX_NO) {
-        ESP_LOGE(TAG, "file numbers used up (R%04d.AVI exists)", APP_REC_MAX_NO);
-        return ESP_ERR_NOT_SUPPORTED;
+    uint64_t total = 0, free_bytes = 0;
+    if (esp_vfs_fat_info(BSP_SD_MOUNT_POINT, &total, &free_bytes) != ESP_OK) {
+        return true;    /* unknown: let the writes tell */
     }
-    char path[48];
-    snprintf(path, sizeof(path), APP_REC_DIR "/R%04" PRIu32 ".AVI", no);
+    return free_bytes >= (uint64_t)APP_REC_MIN_FREE_MB * 1024 * 1024;
+}
+
+/* Opens Rnnnn.AVI for *no, skipping numbers whose name is already taken
+ * (*no is advanced to the file opened). */
+static esp_err_t open_file(uint32_t *no)
+{
     const avi_config_t cfg = {
         .width = s_rec_w,
         .height = s_rec_h,
@@ -151,10 +169,26 @@ static esp_err_t open_file(uint32_t no)
         .io_buf = s_io_buf,
         .io_buf_size = APP_REC_WRITE_BUF_KB * 1024,
     };
-    ESP_RETURN_ON_ERROR(avi_open(path, &cfg, &s_avi), TAG, "open %s", path);
+    for (int tries = 0;; tries++, (*no)++) {
+        if (*no > APP_REC_MAX_NO) {
+            ESP_LOGE(TAG, "file numbers used up (R%04d.AVI exists)", APP_REC_MAX_NO);
+            return ESP_ERR_NOT_SUPPORTED;
+        }
+        char path[48];
+        snprintf(path, sizeof(path), APP_REC_DIR "/R%04" PRIu32 ".AVI", *no);
+        esp_err_t err = avi_open(path, &cfg, &s_avi);
+        if (err == ESP_ERR_INVALID_STATE && tries < 16) {
+            continue;   /* name taken: try the next number */
+        }
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "open %s failed", path);
+            return err;
+        }
+        break;
+    }
     s_seg_first_us = s_seg_last_us = 0;
-    STATS(s_stats.file_no = no);
-    ESP_LOGI(TAG, "recording to %s", path);
+    STATS(s_stats.file_no = *no);
+    ESP_LOGI(TAG, "recording to R%04" PRIu32 ".AVI", *no);
     return ESP_OK;
 }
 
@@ -203,23 +237,39 @@ static void writer_task(void *arg)
         xQueueReceive(s_writeq, &it, portMAX_DELAY);
         if (it.kind == ITEM_STOP) {
             close_file();
+            STATS(if (s_stats.state == RECORDER_RECORDING) s_stats.state = RECORDER_IDLE);
+            atomic_store(&s_writer_busy, false);
             xSemaphoreGive(s_stopped);
             continue;
         }
-        if (!s_avi) {           /* stopped or failed: late items are dropped */
-            give_back(&it);
+        if (!s_avi || it.gen != (uint16_t)atomic_load(&s_gen)) {
+            give_back(&it);     /* stopped or failed, or left over from an earlier recording */
             continue;
         }
         esp_err_t err = ESP_OK;
         int64_t t0 = esp_timer_get_time();
         if (it.kind == ITEM_VIDEO) {
+            if (t0 - s_free_checked_us >= (int64_t)APP_REC_FREE_CHECK_S * 1000000) {
+                s_free_checked_us = t0;
+                if (!card_has_room()) {
+                    ESP_LOGW(TAG, "card almost full: recording stopped");
+                    stop_sources();
+                    close_file();
+                    STATS(s_stats.state = RECORDER_FULL);
+                    atomic_store(&s_writer_busy, false);
+                    give_back(&it);
+                    continue;
+                }
+            }
             if (s_seg_first_us && it.t_us - s_seg_first_us >= (int64_t)APP_REC_SEGMENT_S * 1000000) {
                 err = close_file();
                 if (err == ESP_OK) {
-                    err = open_file(++s_next_no);
+                    ++s_next_no;
+                    err = open_file(&s_next_no);
                     if (err == ESP_ERR_NOT_SUPPORTED) {
                         stop_sources();
                         STATS(s_stats.state = RECORDER_FULL);
+                        atomic_store(&s_writer_busy, false);
                         give_back(&it);
                         continue;
                     }
@@ -227,6 +277,8 @@ static void writer_task(void *arg)
             }
             if (err == ESP_OK) {
                 err = avi_write_video(s_avi, s_vslot[it.slot], it.len);
+            }
+            if (err == ESP_OK) {
                 if (!s_seg_first_us) {
                     s_seg_first_us = it.t_us;
                 }
@@ -235,7 +287,9 @@ static void writer_task(void *arg)
             }
         } else {
             err = avi_write_audio(s_avi, s_aslot[it.slot], it.len);
-            STATS(s_stats.audio_chunks++);
+            if (err == ESP_OK) {
+                STATS(s_stats.audio_chunks++);
+            }
         }
         uint32_t ms = (uint32_t)((esp_timer_get_time() - t0) / 1000);
         STATS(if (ms > s_stats.write_ms_max) s_stats.write_ms_max = ms);
@@ -245,6 +299,14 @@ static void writer_task(void *arg)
             stop_sources();
             close_file();
             STATS(s_stats.state = RECORDER_ERROR);
+            /* A removed card stays "mounted" otherwise: the next start remounts it.
+             * Skipped if the web page holds it; then the next failed start does it. */
+            if (xSemaphoreTake(s_card_mtx, 0) == pdTRUE) {
+                bsp_sdcard_unmount();
+                atomic_store(&s_card, false);
+                xSemaphoreGive(s_card_mtx);
+            }
+            atomic_store(&s_writer_busy, false);
         } else if (s_avi) {
             uint64_t bytes = avi_bytes(s_avi);
             STATS(s_stats.bytes = bytes);
@@ -262,6 +324,7 @@ static void encoder_task(void *arg)
             continue;
         }
         int64_t t = esp_timer_get_time();
+        const uint16_t gen = (uint16_t)atomic_load(&s_gen);
         uint8_t slot;
         if (!atomic_load(&s_active) || xQueueReceive(s_vfree, &slot, 0) != pdTRUE) {
             if (atomic_load(&s_active)) {
@@ -283,7 +346,7 @@ static void encoder_task(void *arg)
         frame_mbox_release(mb, &f);
         uint32_t us = (uint32_t)(esp_timer_get_time() - t);
         STATS(if (us > s_stats.encode_us_max) s_stats.encode_us_max = us);
-        item_t it = { .kind = ITEM_VIDEO, .slot = slot, .len = len, .t_us = t };
+        item_t it = { .kind = ITEM_VIDEO, .slot = slot, .gen = gen, .len = len, .t_us = t };
         if (err != ESP_OK || xQueueSend(s_writeq, &it, 0) != pdTRUE) {
             xQueueSend(s_vfree, &slot, 0);
             STATS(s_stats.frames_dropped++);
@@ -298,6 +361,7 @@ static void audio_task(void *arg)
     static uint8_t scratch[AUDIO_CHUNK];
     for (;;) {
         xSemaphoreTake(s_audio_go, portMAX_DELAY);
+        const uint16_t gen = (uint16_t)atomic_load(&s_gen);
         esp_codec_dev_sample_info_t fs = {
             .bits_per_sample = 16,
             .channel = AUDIO_CHANNELS,
@@ -321,7 +385,7 @@ static void audio_task(void *arg)
                 }
                 break;
             }
-            item_t it = { .kind = ITEM_AUDIO, .slot = slot, .len = AUDIO_CHUNK };
+            item_t it = { .kind = ITEM_AUDIO, .slot = slot, .gen = gen, .len = AUDIO_CHUNK };
             if (!have || xQueueSend(s_writeq, &it, 0) != pdTRUE) {
                 if (have) {
                     xQueueSend(s_afree, &slot, 0);
@@ -394,6 +458,12 @@ esp_err_t recorder_start(void)
     if (atomic_load(&s_active)) {
         return ESP_OK;
     }
+    if (atomic_load(&s_writer_busy)) {
+        /* The last file is still being closed (a slow card outlasted recorder_stop). */
+        ESP_LOGW(TAG, "previous recording still closing");
+        return ESP_ERR_INVALID_STATE;
+    }
+    xSemaphoreTake(s_stopped, 0);   /* a token left by a stop that timed out */
     if (!atomic_load(&s_card)) {
         /* No reader holds the lock for long while no card is mounted. */
         xSemaphoreTake(s_card_mtx, portMAX_DELAY);
@@ -424,11 +494,21 @@ esp_err_t recorder_start(void)
         s_rec_h = APP_CAM_BUILTIN_H;
     }
     s_next_no = next_file_no();
-    if (s_next_no > APP_REC_MAX_NO) {
+    if (s_next_no > APP_REC_MAX_NO || !card_has_room()) {
         STATS(s_stats.state = RECORDER_FULL);
         return ESP_ERR_NOT_SUPPORTED;
     }
-    if (open_file(s_next_no) != ESP_OK) {
+    atomic_fetch_add(&s_gen, 1);    /* items still queued from the last recording are dropped */
+    esp_err_t open_err = open_file(&s_next_no);
+    if (open_err == ESP_ERR_NOT_SUPPORTED) {
+        STATS(s_stats.state = RECORDER_FULL);
+        return open_err;
+    }
+    if (open_err == ESP_ERR_INVALID_STATE) {
+        STATS(s_stats.state = RECORDER_ERROR);     /* the names are taken: the card itself is fine */
+        return open_err;
+    }
+    if (open_err != ESP_OK) {
         /* Card removed or full: remount on the next attempt, unless the web page
          * is reading it right now (then the next attempt tries the card again). */
         if (xSemaphoreTake(s_card_mtx, 0) == pdTRUE) {
@@ -443,8 +523,10 @@ esp_err_t recorder_start(void)
           s_stats.bytes = 0;
           s_stats.encode_us_max = s_stats.write_ms_max = 0);
     int64_t now = esp_timer_get_time();
+    s_free_checked_us = now;    /* checked just above */
     STATS(s_start_us = now);
     STATS(s_stats.state = RECORDER_RECORDING);
+    atomic_store(&s_writer_busy, true);
     atomic_store(&s_active, true);
     if (s_mic) {
         xSemaphoreGive(s_audio_go);
@@ -487,32 +569,56 @@ void recorder_push_jpeg(const uint8_t *jpeg, size_t len, int64_t t_us)
     if (!atomic_load(&s_uvc_active)) {
         return;
     }
+    const uint16_t gen = (uint16_t)atomic_load(&s_gen);
     uint8_t slot;
     if (len > VIDEO_SLOT || xQueueReceive(s_vfree, &slot, 0) != pdTRUE) {
         STATS(s_stats.frames_dropped++);
         return;
     }
     memcpy(s_vslot[slot], jpeg, len);
-    item_t it = { .kind = ITEM_VIDEO, .slot = slot, .len = (uint32_t)len, .t_us = t_us };
+    item_t it = { .kind = ITEM_VIDEO, .slot = slot, .gen = gen, .len = (uint32_t)len, .t_us = t_us };
     if (xQueueSend(s_writeq, &it, 0) != pdTRUE) {
         xQueueSend(s_vfree, &slot, 0);
         STATS(s_stats.frames_dropped++);
     }
 }
 
-void recorder_stop(void)
+/* Sources off, then the writer closes the file. Only the caller that turns
+ * s_active off gets here, so the stop item is queued once. */
+static bool finish_recording(void)
 {
-    if (!atomic_load(&s_active)) {
-        return;
-    }
     stop_sources();
     vTaskDelay(pdMS_TO_TICKS(APP_REC_AUDIO_CHUNK_MS + 50));    /* let in-flight items reach the queue */
     const item_t stop = { .kind = ITEM_STOP };
-    if (xQueueSend(s_writeq, &stop, pdMS_TO_TICKS(1000)) != pdTRUE ||
-        xSemaphoreTake(s_stopped, pdMS_TO_TICKS(5000)) != pdTRUE) {
-        ESP_LOGE(TAG, "the writer did not finish the file");
+    return xQueueSend(s_writeq, &stop, pdMS_TO_TICKS(1000)) == pdTRUE;
+}
+
+void recorder_uvc_size(uint16_t w, uint16_t h)
+{
+    if (!atomic_load(&s_uvc_active) || (w == s_rec_w && h == s_rec_h)) {
+        return;
     }
-    STATS(if (s_stats.state == RECORDER_RECORDING) s_stats.state = RECORDER_IDLE);
+    if (!atomic_exchange(&s_active, false)) {
+        return;
+    }
+    ESP_LOGW(TAG, "UVC camera came back as %ux%u, recording was %ux%u: recording stopped",
+             w, h, s_rec_w, s_rec_h);
+    STATS(s_stats.state = RECORDER_ERROR);
+    if (!finish_recording()) {
+        ESP_LOGE(TAG, "could not ask the writer to finish the file");
+    }
+}
+
+void recorder_stop(void)
+{
+    if (!atomic_exchange(&s_active, false)) {
+        return;
+    }
+    /* On a timeout the writer still owns the file: the state stays RECORDING
+     * and recorder_start refuses until the writer has closed it. */
+    if (!finish_recording() || xSemaphoreTake(s_stopped, pdMS_TO_TICKS(5000)) != pdTRUE) {
+        ESP_LOGE(TAG, "the writer did not finish the file yet");
+    }
     recorder_stats_t st;
     recorder_get_stats(&st);
     ESP_LOGI(TAG, "stopped: %" PRIu32 " frames (%" PRIu32 " dropped), %" PRIu32 " audio chunks (%" PRIu32

@@ -20,13 +20,16 @@ typedef struct {
     size_t io_buf_size;
 } avi_config_t;
 
+/* Fails with ESP_ERR_INVALID_STATE when `path` already exists (any letter case). */
 esp_err_t avi_open(const char *path, const avi_config_t *cfg, avi_writer_t **out);
 esp_err_t avi_write_video(avi_writer_t *avi, const void *jpeg, size_t len);
 esp_err_t avi_write_audio(avi_writer_t *avi, const void *pcm, size_t len);
 
 /* Writes the index and patches the headers. duration_us is the time between
- * the first and the last video frame plus one frame period. The writer is
- * freed even if writing fails. */
+ * the first and the last video frame plus one frame period. After a write
+ * error the file is cut back to the last complete chunk, and without room for
+ * the index it is finished without one; both still return an error. The
+ * writer is freed even if writing fails. */
 esp_err_t avi_close(avi_writer_t *avi, int64_t duration_us);
 
 uint32_t avi_video_frames(const avi_writer_t *avi);

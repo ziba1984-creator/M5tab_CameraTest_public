@@ -17,6 +17,9 @@
 #include "cam_uvc_ctrl.h"
 #include "recorder.h"
 #include "net_wifi.h"
+#include "net_eth.h"
+#include "modules.h"
+#include "stack_probe.h"
 
 static const char *TAG = "main";
 
@@ -303,6 +306,15 @@ void app_main(void)
     if (net_err != ESP_OK) {
         ESP_LOGW(TAG, "Wi-Fi disabled (%s)", esp_err_to_name(net_err));
     }
+    /* After net_wifi_init (NVS). Absent module: no wired LAN, nothing else changes. */
+    esp_err_t eth_err = net_eth_init();
+    if (eth_err != ESP_OK && eth_err != ESP_ERR_NOT_FOUND) {
+        ESP_LOGW(TAG, "wired LAN disabled (%s)", esp_err_to_name(eth_err));
+    }
+    esp_err_t mod_err = modules_init();
+    if (mod_err != ESP_OK) {
+        ESP_LOGW(TAG, "Stack modules disabled (%s)", esp_err_to_name(mod_err));
+    }
     esp_err_t ui_err = camera_ui_init();
     if (ui_err != ESP_OK) {
         ESP_LOGW(TAG, "camera UI disabled (%s)", esp_err_to_name(ui_err));
@@ -310,6 +322,9 @@ void app_main(void)
         touch_input_set_press_callback(camera_ui_on_touch);
     }
     ESP_ERROR_CHECK(cam_uvc_init());
+#if APP_STACK_PROBE
+    stack_probe_run();
+#endif
 
     ESP_ERROR_CHECK(display_comp_attach(DISP_PANE_LEFT, cam_builtin_mbox(), APP_CAM_BUILTIN_ROT_DEG, COLOR_NO_CAM_BUILTIN));
     ESP_ERROR_CHECK(display_comp_attach(DISP_PANE_RIGHT, cam_uvc_mbox(), APP_UVC_ROT_DEG, COLOR_NO_CAM_UVC));

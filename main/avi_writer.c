@@ -42,6 +42,12 @@ struct avi_writer {
     uint64_t audio_bytes;
     uint32_t max_chunk;
     bool failed;
+    struct {                    /* state after the last completely written chunk */
+        uint64_t pos;
+        size_t idx_n;
+        uint32_t video_frames;
+        uint64_t audio_bytes;
+    } good;
 };
 
 static void put16(uint8_t *p, uint16_t v) { p[0] = v; p[1] = v >> 8; }
@@ -49,8 +55,9 @@ static void put32(uint8_t *p, uint32_t v) { p[0] = v; p[1] = v >> 8; p[2] = v >>
 static void put4cc(uint8_t *p, const char *s) { memcpy(p, s, 4); }
 static uint32_t fourcc(const char *s) { return s[0] | s[1] << 8 | s[2] << 16 | (uint32_t)s[3] << 24; }
 
-/* final: the movi list ends at pos and the idx1 follows it. The frame rate is
- * the measured one when duration_us is usable, else the nominal 30 fps. */
+/* final: the movi list ends at pos and the idx1 follows it. Otherwise the file
+ * ends at pos and has no index. The frame rate is the measured one when
+ * duration_us is usable, else the nominal 30 fps. */
 static void build_header(const avi_writer_t *avi, uint8_t *h, bool final, int64_t duration_us)
 {
     const avi_config_t *c = &avi->cfg;
@@ -72,7 +79,7 @@ static void build_header(const avi_writer_t *avi, uint8_t *h, bool final, int64_
     put4cc(a, "avih"); put32(a + 4, 56);
     put32(a + 8, us_per_frame);
     put32(a + 12, (uint32_t)(us_per_frame ? (uint64_t)avi->max_chunk * 1000000 / us_per_frame : 0));
-    put32(a + 20, AVIF_HASINDEX | AVIF_ISINTERLEAVED);
+    put32(a + 20, (final ? AVIF_HASINDEX : 0) | AVIF_ISINTERLEAVED);
     put32(a + 24, avi->video_frames);
     put32(a + 32, 2);                                   /* streams */
     put32(a + 36, avi->max_chunk);
@@ -164,12 +171,14 @@ esp_err_t avi_open(const char *path, const avi_config_t *cfg, avi_writer_t **out
     int fd = open(path, O_WRONLY | O_CREAT | O_EXCL, 0644);
     avi->f = fd >= 0 ? fdopen(fd, "wb") : NULL;
     if (!avi->f) {
+        int saved = errno;
         if (fd >= 0) {
             close(fd);
+            unlink(path);
         }
         free(avi);
-        ESP_LOGE(TAG, "cannot create %s (errno %d)", path, errno);
-        return ESP_FAIL;
+        ESP_LOGE(TAG, "cannot create %s (errno %d)", path, saved);
+        return saved == EEXIST ? ESP_ERR_INVALID_STATE : ESP_FAIL;
     }
     if (cfg->io_buf) {
         setvbuf(avi->f, cfg->io_buf, _IOFBF, cfg->io_buf_size);
@@ -181,16 +190,27 @@ esp_err_t avi_open(const char *path, const avi_config_t *cfg, avi_writer_t **out
     if (write_all(avi, h, sizeof(h)) != ESP_OK) {
         fclose(avi->f);
         free(avi);
+        unlink(path);   /* do not leave an empty file that takes up a number */
         return ESP_FAIL;
     }
+    avi->good.pos = avi->pos;
     *out = avi;
     return ESP_OK;
+}
+
+static void mark_good(avi_writer_t *avi)
+{
+    avi->good.pos = avi->pos;
+    avi->good.idx_n = avi->idx_n;
+    avi->good.video_frames = avi->video_frames;
+    avi->good.audio_bytes = avi->audio_bytes;
 }
 
 esp_err_t avi_write_video(avi_writer_t *avi, const void *jpeg, size_t len)
 {
     ESP_RETURN_ON_ERROR(write_chunk(avi, "00dc", jpeg, len, AVIIF_KEYFRAME), TAG, "video chunk");
     avi->video_frames++;
+    mark_good(avi);
     return ESP_OK;
 }
 
@@ -198,36 +218,54 @@ esp_err_t avi_write_audio(avi_writer_t *avi, const void *pcm, size_t len)
 {
     ESP_RETURN_ON_ERROR(write_chunk(avi, "01wb", pcm, len, 0), TAG, "audio chunk");
     avi->audio_bytes += len;
+    mark_good(avi);
     return ESP_OK;
 }
 
+/* Finishes the file even after a write error: it is cut back to the last
+ * complete chunk, and if the index cannot be written (card full), the header
+ * still describes the movi data so the recording plays without an index. */
 esp_err_t avi_close(avi_writer_t *avi, int64_t duration_us)
 {
-    esp_err_t err = avi->failed ? ESP_FAIL : ESP_OK;
-    if (err == ESP_OK) {
+    esp_err_t err = ESP_OK;
+    if (avi->failed) {
+        err = ESP_FAIL;
+        avi->pos = avi->good.pos;
+        avi->idx_n = avi->good.idx_n;
+        avi->video_frames = avi->good.video_frames;
+        avi->audio_bytes = avi->good.audio_bytes;
+        clearerr(avi->f);
+        avi->failed = fseek(avi->f, (long)avi->pos, SEEK_SET) != 0;
+    }
+    const uint64_t movi_end = avi->pos;
+    bool indexed = false;
+    if (!avi->failed) {
         uint8_t head[8];
         put4cc(head, "idx1");
         put32(head + 4, avi->idx_n * sizeof(idx_entry_t));
-        err = write_all(avi, head, sizeof(head));
-        uint64_t movi_end = avi->pos - sizeof(head);
-        for (size_t i = 0; err == ESP_OK && i < avi->idx_n; i++) {
-            uint8_t e[16];
-            put32(e, avi->idx[i].ckid);
-            put32(e + 4, avi->idx[i].flags);
-            put32(e + 8, avi->idx[i].offset);
-            put32(e + 12, avi->idx[i].size);
-            err = write_all(avi, e, sizeof(e));
+        esp_err_t e = write_all(avi, head, sizeof(head));
+        for (size_t i = 0; e == ESP_OK && i < avi->idx_n; i++) {
+            uint8_t ent[16];
+            put32(ent, avi->idx[i].ckid);
+            put32(ent + 4, avi->idx[i].flags);
+            put32(ent + 8, avi->idx[i].offset);
+            put32(ent + 12, avi->idx[i].size);
+            e = write_all(avi, ent, sizeof(ent));
         }
-        if (err == ESP_OK) {
-            uint64_t end = avi->pos;
-            avi->pos = movi_end;    /* build_header derives the movi size from pos */
-            uint8_t h[HDR_BYTES];
-            build_header(avi, h, true, duration_us);
-            avi->pos = end;
-            if (fseek(avi->f, 0, SEEK_SET) != 0 || fwrite(h, 1, sizeof(h), avi->f) != sizeof(h)) {
-                err = ESP_FAIL;
-            }
-        }
+        indexed = e == ESP_OK && fflush(avi->f) == 0;
+    }
+    if (!indexed) {
+        err = ESP_FAIL;
+    }
+
+    /* Straight to the descriptor: rewriting the header needs no free space, and
+     * data still stuck in the stdio buffer after a failed flush cannot get in
+     * its way. pwrite() leaves the descriptor's position alone. */
+    uint8_t h[HDR_BYTES];
+    avi->pos = movi_end;    /* build_header derives the movi size from pos */
+    build_header(avi, h, indexed, duration_us);
+    if (pwrite(fileno(avi->f), h, sizeof(h), 0) != (ssize_t)sizeof(h)) {
+        err = ESP_FAIL;
     }
     if (fclose(avi->f) != 0) {
         err = ESP_FAIL;
